@@ -1,0 +1,56 @@
+{
+  "Goldfish": {
+    "Memory": {
+      "ShortTerm": {
+        "Enabled": true,
+        "MaxMessages": 12,
+        "MaxAge": "06:00:00"
+      },
+      "MediumTerm": {
+        "Enabled": true,
+        "CompressionThresholdMessages": 24,
+        "RetainRecentMessages": 8,
+        "MaxSummaries": 3,
+        "MaxSummaryChars": 2000
+      },
+      "LongTerm": {
+        "Enabled": true,
+        "MaxMemories": 5,
+        "MinimumImportance": 0.0,
+        "MinimumConfidence": 0.0,
+        "ExcludeExpired": true
+      },
+      "Admission": {
+        "RejectDetectedSecrets": true,
+        "RejectSecretSensitivity": true,
+        "DeduplicateByContent": true,
+        "MaxContentChars": 8000
+      },
+      "Sqlite": {
+        "Enabled": true,
+        "DatabasePath": "~/.goldfish/memory.db",
+        "EnableWriteAheadLogging": true,
+        "BusyTimeoutSeconds": 30,
+        "Vector": {
+          "Enabled": true,
+          "ExtensionPath": null,
+          "IndexMode": "flat",
+          "Distance": "cos",
+          "CandidateMultiplier": 4,
+          "FallbackToManagedSearch": true
+        }
+      },
+      "Embedding": {
+        "Enabled": true,
+        "Endpoint": "http://127.0.0.1:18790/v1/embeddings",
+        "Model": "qmd-embeddinggemma-300m",
+        "Dimensions": 768,
+        "TimeoutSeconds": 30,
+        "QueryInputType": "query",
+        "DocumentInputType": "document",
+        "MinimumSimilarity": 0.25,
+        "FallbackToLexicalSearch": true
+      }
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "Goldfish.Harness",
+  "version": "0.1.0",
+  "buildDate": "2026-07-19T01:23:19+08:00",
+  "buildNumber": 1,
+  "description": "Standalone .NET reasoning harness with tools, skills, and layered memory",
+  "techStack": [".NET 10", "Microsoft.Extensions.AI", "SQLite", "SQLite Vec1"]
+}
