@@ -122,8 +122,7 @@ public sealed class MediumTermMemoryOptions
     public ISet<string> IncludeRoles { get; set; } = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
         "user",
-        "assistant",
-        "tool"
+        "assistant"
     };
 }
 

@@ -135,3 +135,32 @@ credential-looking content. Content hashes deduplicate equivalent memories
 within a partition, and explicit IDs cannot overwrite another partition.
 Retrieval excludes expired or low-confidence entries and reranks candidates with
 semantic similarity, importance, freshness, and confidence.
+
+## Skills, tool traces, and authorization
+
+Dynamic skills are scoped to the active conversation instead of user profile
+memory. Hosts can pass an `ISkillSessionStore` to `GoldfishHarnessRequest` so
+skills loaded through `goldfish_load_skill` are associated with the current
+tenant/user/agent/workspace/session partition and restored on the next run for
+that same session. `SkillOptions.PersistLoadedSkills` is enabled by default.
+Use `SqliteHarnessStateStore` when this state should survive process restarts.
+
+Tool execution results are part of the current model loop only. They are not
+stored as long-term user profile memory, and medium-term compression defaults to
+`user` and `assistant` roles only. Hosts that need replay, debugging, or audit
+can pass an `IToolExecutionStore`; the harness records run/session partition,
+tool id, success state, authorization decision, timestamps, and SHA-256 hashes
+of arguments/results without persisting raw tool payloads.
+`SqliteHarnessStateStore` implements both `ISkillSessionStore` and
+`IToolExecutionStore`.
+
+Sandbox or user-approval policy is injected through `IToolAuthorizationHook`.
+The hook receives the run/session partition, tool id/name, and raw arguments
+before execution and returns `Allow`, `Deny`, or `RequireApproval`. A denied or
+approval-required call is returned as a normal tool result event, so the gateway
+can surface an approval card and later steer or retry after the user grants
+permission.
+
+All system-level context is merged into the single leading `system` message.
+The harness must not append additional `system` messages after user, assistant,
+or tool messages.

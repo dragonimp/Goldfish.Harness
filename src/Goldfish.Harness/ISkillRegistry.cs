@@ -10,6 +10,7 @@ public sealed class SkillOptions
     public bool Enabled { get; set; } = true;
     public bool ExposeSkillIndexTool { get; set; } = true;
     public bool ExposeLoadSkillTool { get; set; } = true;
+    public bool PersistLoadedSkills { get; set; } = true;
     public bool RestrictToolsToLoadedSkills { get; set; } = false;
     public int MaxSearchResults { get; set; } = 10;
     public int MaxLoadedSkills { get; set; } = 5;
@@ -38,6 +39,88 @@ public interface ISkillRegistry
     IReadOnlyList<SkillMetadata> List();
     IReadOnlyList<SkillMetadata> Search(string query, int limit = 10);
     SkillContent? Load(string name);
+}
+
+public sealed record SkillSessionKey
+{
+    public string TenantId { get; init; } = string.Empty;
+    public string UserId { get; init; } = string.Empty;
+    public string AgentId { get; init; } = string.Empty;
+    public string WorkspaceId { get; init; } = string.Empty;
+    public string SessionId { get; init; } = string.Empty;
+}
+
+public sealed record SkillSessionEntry
+{
+    public string SkillName { get; init; } = string.Empty;
+    public DateTimeOffset LoadedAt { get; init; } = DateTimeOffset.UtcNow;
+    public string? Source { get; init; }
+}
+
+public interface ISkillSessionStore
+{
+    Task<IReadOnlyList<SkillSessionEntry>> LoadAsync(SkillSessionKey key, CancellationToken ct = default);
+    Task RecordLoadedAsync(SkillSessionKey key, SkillSessionEntry entry, CancellationToken ct = default);
+}
+
+public sealed class NullSkillSessionStore : ISkillSessionStore
+{
+    public static NullSkillSessionStore Instance { get; } = new();
+
+    private NullSkillSessionStore()
+    {
+    }
+
+    public Task<IReadOnlyList<SkillSessionEntry>> LoadAsync(SkillSessionKey key, CancellationToken ct = default)
+        => Task.FromResult<IReadOnlyList<SkillSessionEntry>>([]);
+
+    public Task RecordLoadedAsync(SkillSessionKey key, SkillSessionEntry entry, CancellationToken ct = default)
+        => Task.CompletedTask;
+}
+
+public sealed class InMemorySkillSessionStore : ISkillSessionStore
+{
+    private readonly Dictionary<string, Dictionary<string, SkillSessionEntry>> _entries = new(StringComparer.Ordinal);
+    private readonly object _lock = new();
+
+    public Task<IReadOnlyList<SkillSessionEntry>> LoadAsync(SkillSessionKey key, CancellationToken ct = default)
+    {
+        lock (_lock)
+        {
+            if (!_entries.TryGetValue(BuildKey(key), out var entries))
+            {
+                return Task.FromResult<IReadOnlyList<SkillSessionEntry>>([]);
+            }
+
+            return Task.FromResult<IReadOnlyList<SkillSessionEntry>>(
+                entries.Values.OrderBy(entry => entry.LoadedAt).ToList());
+        }
+    }
+
+    public Task RecordLoadedAsync(SkillSessionKey key, SkillSessionEntry entry, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(entry.SkillName))
+        {
+            return Task.CompletedTask;
+        }
+
+        lock (_lock)
+        {
+            var partitionKey = BuildKey(key);
+            if (!_entries.TryGetValue(partitionKey, out var entries))
+            {
+                entries = new Dictionary<string, SkillSessionEntry>(StringComparer.OrdinalIgnoreCase);
+                _entries[partitionKey] = entries;
+            }
+
+            entries[entry.SkillName.Trim()] = entry;
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private static string BuildKey(SkillSessionKey key)
+        => string.Join('\u001f', key.TenantId, key.UserId, key.AgentId, key.WorkspaceId, key.SessionId);
 }
 
 public sealed class InMemorySkillRegistry : ISkillRegistry
@@ -215,6 +298,7 @@ internal sealed class SkillRuntimeState
 {
     private readonly SkillOptions _options;
     private readonly Dictionary<string, SkillContent> _loadedSkills = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<string> _restoredMissingSkills = [];
 
     public SkillRuntimeState(SkillOptions options)
     {
@@ -222,6 +306,7 @@ internal sealed class SkillRuntimeState
     }
 
     public IReadOnlyList<SkillContent> LoadedSkills => _loadedSkills.Values.ToList();
+    public IReadOnlyList<string> RestoredMissingSkills => _restoredMissingSkills;
 
     public bool CanLoad(string skillName)
     {
@@ -235,6 +320,14 @@ internal sealed class SkillRuntimeState
     public void MarkLoaded(SkillContent skill)
     {
         _loadedSkills[skill.Metadata.Name] = skill;
+    }
+
+    public void MarkRestoredMissing(string skillName)
+    {
+        if (!_restoredMissingSkills.Contains(skillName, StringComparer.OrdinalIgnoreCase))
+        {
+            _restoredMissingSkills.Add(skillName);
+        }
     }
 
     public ISet<string> GetAllowedToolIds()
@@ -392,12 +485,21 @@ internal sealed class LoadSkillTool : ITool
     private readonly ISkillRegistry _registry;
     private readonly SkillRuntimeState _state;
     private readonly SkillOptions _options;
+    private readonly ISkillSessionStore _sessionStore;
+    private readonly SkillSessionKey _sessionKey;
 
-    public LoadSkillTool(ISkillRegistry registry, SkillRuntimeState state, SkillOptions options)
+    public LoadSkillTool(
+        ISkillRegistry registry,
+        SkillRuntimeState state,
+        SkillOptions options,
+        ISkillSessionStore? sessionStore = null,
+        SkillSessionKey? sessionKey = null)
     {
         _registry = registry;
         _state = state;
         _options = options;
+        _sessionStore = sessionStore ?? NullSkillSessionStore.Instance;
+        _sessionKey = sessionKey ?? new SkillSessionKey();
     }
 
     public string Id => "goldfish.load_skill";
@@ -416,33 +518,44 @@ internal sealed class LoadSkillTool : ITool
 
     public Task<bool> IsAvailableAsync() => Task.FromResult(_options.Enabled && _options.ExposeLoadSkillTool);
 
-    public Task<ToolResult> ExecuteAsync(string arguments)
+    public async Task<ToolResult> ExecuteAsync(string arguments)
     {
         var input = ParseArguments(arguments);
         if (string.IsNullOrWhiteSpace(input.SkillName))
         {
-            return Task.FromResult(new ToolResult { Success = false, Error = "skill_name is required." });
+            return new ToolResult { Success = false, Error = "skill_name is required." };
         }
 
         var skillName = input.SkillName.Trim();
         if (_options.AllowedSkills.Count > 0 && !_options.AllowedSkills.Contains(skillName))
         {
-            return Task.FromResult(new ToolResult { Success = false, Error = $"Skill is not allowed for this run: {skillName}" });
+            return new ToolResult { Success = false, Error = $"Skill is not allowed for this run: {skillName}" };
         }
 
         if (!_state.CanLoad(skillName))
         {
-            return Task.FromResult(new ToolResult { Success = false, Error = $"Maximum loaded skills reached: {_options.MaxLoadedSkills}" });
+            return new ToolResult { Success = false, Error = $"Maximum loaded skills reached: {_options.MaxLoadedSkills}" };
         }
 
         var skill = _registry.Load(skillName);
         if (skill == null)
         {
-            return Task.FromResult(new ToolResult { Success = false, Error = $"Skill not found: {skillName}" });
+            return new ToolResult { Success = false, Error = $"Skill not found: {skillName}" };
         }
 
+        var alreadyLoaded = _state.IsLoaded(skill.Metadata.Name);
         _state.MarkLoaded(skill);
-        return Task.FromResult(new ToolResult
+        if (_options.PersistLoadedSkills)
+        {
+            await _sessionStore.RecordLoadedAsync(_sessionKey, new SkillSessionEntry
+            {
+                SkillName = skill.Metadata.Name,
+                LoadedAt = DateTimeOffset.UtcNow,
+                Source = "goldfish_load_skill"
+            });
+        }
+
+        return new ToolResult
         {
             Success = true,
             Data = new
@@ -453,10 +566,10 @@ internal sealed class LoadSkillTool : ITool
                 skill.Metadata.AllowedTools,
                 instructions = skill.Instructions
             },
-            DisplayText = _state.IsLoaded(skillName)
-                ? $"已加载 Skill: {skill.Metadata.Name}"
-                : $"Skill 已存在: {skill.Metadata.Name}"
-        });
+            DisplayText = alreadyLoaded
+                ? $"Skill 已存在: {skill.Metadata.Name}"
+                : $"已加载 Skill: {skill.Metadata.Name}"
+        };
     }
 
     private static LoadSkillArguments ParseArguments(string arguments)

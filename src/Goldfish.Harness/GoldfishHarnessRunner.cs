@@ -53,11 +53,13 @@ public sealed class GoldfishHarnessRunner
         GoldfishHarnessRequest request,
         CancellationToken ct = default)
     {
+        var runId = Guid.NewGuid().ToString("n");
         var skillOptions = request.SkillOptions ?? SkillOptions.Default;
         var skillState = new SkillRuntimeState(skillOptions);
-        var internalTools = BuildInternalTools(skillState, skillOptions);
+        await RestoreSessionSkillsAsync(request, skillState, skillOptions, ct);
+        var internalTools = BuildInternalTools(request, skillState, skillOptions);
         var toolFunctions = BuildToolFunctions(BuildEffectiveTools(_toolRegistry.GetAll(), internalTools, skillState, skillOptions));
-        var messages = BuildMessages(request);
+        var messages = BuildMessages(request, skillState);
         var result = new GoldfishHarnessRunResult();
         _logger.LogInformation("Goldfish Harness starting. tools={ToolCount}, model tools mode={ToolMode}", toolFunctions.Count, toolFunctions.Count > 0 ? "native" : "none");
 
@@ -87,7 +89,7 @@ public sealed class GoldfishHarnessRunner
 
                 foreach (var functionCall in functionCalls)
                 {
-                    var record = await ExecuteFunctionCallAsync(functionCall, toolFunctions, ct);
+                    var record = await ExecuteFunctionCallAsync(request, runId, step, functionCall, toolFunctions, ct);
                     result.ToolCalls.Add(record);
                     result.Events.Add(GoldfishHarnessEvent.ToolCall(step, record));
                     result.Events.Add(GoldfishHarnessEvent.ToolResult(step, record));
@@ -108,7 +110,7 @@ public sealed class GoldfishHarnessRunner
             if (action.Kind == GoldfishActionKind.Tool && !string.IsNullOrWhiteSpace(action.Tool))
             {
                 var legacyToolCallId = BuildLegacyToolCallId(step, action.Tool!);
-                var record = await ExecuteLegacyToolActionAsync(action, legacyToolCallId, ct);
+                var record = await ExecuteLegacyToolActionAsync(request, runId, step, action, legacyToolCallId, ct);
                 result.ToolCalls.Add(record);
                 result.Events.Add(GoldfishHarnessEvent.ToolCall(step, record));
                 result.Events.Add(GoldfishHarnessEvent.ToolResult(step, record));
@@ -142,7 +144,7 @@ public sealed class GoldfishHarnessRunner
     {
         var runId = Guid.NewGuid().ToString("n");
         yield return GoldfishHarnessEvent.RunStarted(runId);
-        await foreach (var ev in StreamCoreAsync(request, ct))
+        await foreach (var ev in StreamCoreAsync(request, runId, ct))
         {
             // 统一注入 RunId，保留各事件自带的 EventId/Timestamp。
             yield return ev with { RunId = runId };
@@ -151,13 +153,15 @@ public sealed class GoldfishHarnessRunner
 
     private async IAsyncEnumerable<GoldfishHarnessEvent> StreamCoreAsync(
         GoldfishHarnessRequest request,
+        string runId,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         var skillOptions = request.SkillOptions ?? SkillOptions.Default;
         var skillState = new SkillRuntimeState(skillOptions);
-        var internalTools = BuildInternalTools(skillState, skillOptions);
+        await RestoreSessionSkillsAsync(request, skillState, skillOptions, ct);
+        var internalTools = BuildInternalTools(request, skillState, skillOptions);
         var toolFunctions = BuildToolFunctions(BuildEffectiveTools(_toolRegistry.GetAll(), internalTools, skillState, skillOptions));
-        var messages = BuildMessages(request);
+        var messages = BuildMessages(request, skillState);
         _logger.LogInformation("Goldfish Harness streaming. tools={ToolCount}, model tools mode={ToolMode}", toolFunctions.Count, toolFunctions.Count > 0 ? "native" : "none");
         var toolWasUsed = false;
 
@@ -245,7 +249,7 @@ public sealed class GoldfishHarnessRunner
                         functionCall.Name,
                         SerializeArguments(functionCall.Arguments),
                         functionCall.CallId);
-                    var record = await ExecuteFunctionCallAsync(functionCall, toolFunctions, ct);
+                    var record = await ExecuteFunctionCallAsync(request, runId, step, functionCall, toolFunctions, ct);
                     toolWasUsed = true;
                     yield return GoldfishHarnessEvent.ToolResult(step, record);
                     messages.Add(new MsChatMessage(
@@ -266,7 +270,7 @@ public sealed class GoldfishHarnessRunner
             {
                 var legacyToolCallId = BuildLegacyToolCallId(step, action.Tool!);
                 yield return GoldfishHarnessEvent.ToolCallStart(step, action.Tool!, action.Arguments ?? "{}", legacyToolCallId);
-                var record = await ExecuteLegacyToolActionAsync(action, legacyToolCallId, ct);
+                var record = await ExecuteLegacyToolActionAsync(request, runId, step, action, legacyToolCallId, ct);
                 toolWasUsed = true;
                 yield return GoldfishHarnessEvent.ToolResult(step, record);
                 messages.Add(new MsChatMessage(ChatRole.Assistant, raw));
@@ -326,6 +330,9 @@ public sealed class GoldfishHarnessRunner
     }
 
     private List<MsChatMessage> BuildMessages(GoldfishHarnessRequest request)
+        => BuildMessages(request, null);
+
+    private List<MsChatMessage> BuildMessages(GoldfishHarnessRequest request, SkillRuntimeState? skillState)
     {
         var context = GoldfishRunContext.FromAgentInfo(request.AgentInfo, request.SessionId, request.DisableConfigCache);
         var memoryOptions = request.MemoryOptions ?? MemoryOptions.Default;
@@ -337,6 +344,14 @@ public sealed class GoldfishHarnessRunner
             if (!string.IsNullOrWhiteSpace(memoryPrompt))
             {
                 systemPrompt = $"{systemPrompt.TrimEnd()}\n\n{memoryPrompt}";
+            }
+        }
+        if (skillState is not null)
+        {
+            var loadedSkillsPrompt = skillState.BuildLoadedSkillsPrompt();
+            if (!string.IsNullOrWhiteSpace(loadedSkillsPrompt))
+            {
+                systemPrompt = $"{systemPrompt.TrimEnd()}\n\n{loadedSkillsPrompt}";
             }
         }
 
@@ -444,7 +459,10 @@ public sealed class GoldfishHarnessRunner
         return sb.ToString().Trim();
     }
 
-    private IReadOnlyList<ITool> BuildInternalTools(SkillRuntimeState skillState, SkillOptions skillOptions)
+    private IReadOnlyList<ITool> BuildInternalTools(
+        GoldfishHarnessRequest request,
+        SkillRuntimeState skillState,
+        SkillOptions skillOptions)
     {
         if (_skillRegistry == null || !skillOptions.Enabled)
         {
@@ -458,10 +476,70 @@ public sealed class GoldfishHarnessRunner
         }
         if (skillOptions.ExposeLoadSkillTool)
         {
-            tools.Add(new LoadSkillTool(_skillRegistry, skillState, skillOptions));
+            tools.Add(new LoadSkillTool(
+                _skillRegistry,
+                skillState,
+                skillOptions,
+                request.SkillSessionStore,
+                BuildSkillSessionKey(request)));
         }
         return tools;
     }
+
+    private async Task RestoreSessionSkillsAsync(
+        GoldfishHarnessRequest request,
+        SkillRuntimeState skillState,
+        SkillOptions skillOptions,
+        CancellationToken ct)
+    {
+        if (_skillRegistry == null
+            || !skillOptions.Enabled
+            || !skillOptions.PersistLoadedSkills
+            || request.SkillSessionStore == null)
+        {
+            return;
+        }
+
+        var entries = await request.SkillSessionStore.LoadAsync(BuildSkillSessionKey(request), ct);
+        foreach (var entry in entries.Take(Math.Max(0, skillOptions.MaxLoadedSkills)))
+        {
+            if (string.IsNullOrWhiteSpace(entry.SkillName)) continue;
+            if (skillOptions.AllowedSkills.Count > 0 && !skillOptions.AllowedSkills.Contains(entry.SkillName))
+            {
+                continue;
+            }
+
+            var skill = _skillRegistry.Load(entry.SkillName);
+            if (skill == null)
+            {
+                skillState.MarkRestoredMissing(entry.SkillName);
+                continue;
+            }
+
+            if (skillState.CanLoad(skill.Metadata.Name))
+            {
+                skillState.MarkLoaded(skill);
+            }
+        }
+    }
+
+    private static SkillSessionKey BuildSkillSessionKey(GoldfishHarnessRequest request)
+    {
+        var context = GoldfishRunContext.FromAgentInfo(request.AgentInfo, request.SessionId, request.DisableConfigCache);
+        return new SkillSessionKey
+        {
+            TenantId = GetExtra(request.AgentInfo, "TenantId") ?? string.Empty,
+            UserId = context.User.Id,
+            AgentId = context.Agent.Id ?? string.Empty,
+            WorkspaceId = GetExtra(request.AgentInfo, "WorkspaceId") ?? string.Empty,
+            SessionId = request.SessionId
+        };
+    }
+
+    private static string? GetExtra(AgentInfo agentInfo, string key)
+        => agentInfo.ExtraData.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value)
+            ? value.Trim()
+            : null;
 
     private static IReadOnlyList<ITool> BuildEffectiveTools(
         IList<ITool> registeredTools,
@@ -503,8 +581,21 @@ public sealed class GoldfishHarnessRunner
         var loadedSkillsPrompt = skillState.BuildLoadedSkillsPrompt();
         if (!string.IsNullOrWhiteSpace(loadedSkillsPrompt))
         {
-            messages.Add(new MsChatMessage(ChatRole.System, loadedSkillsPrompt));
+            MergeIntoLeadingSystemMessage(messages, loadedSkillsPrompt);
         }
+    }
+
+    private static void MergeIntoLeadingSystemMessage(List<MsChatMessage> messages, string addition)
+    {
+        if (string.IsNullOrWhiteSpace(addition)) return;
+        if (messages.Count == 0 || messages[0].Role != ChatRole.System)
+        {
+            messages.Insert(0, new MsChatMessage(ChatRole.System, addition.Trim()));
+            return;
+        }
+
+        var existing = messages[0].Text ?? string.Empty;
+        messages[0] = new MsChatMessage(ChatRole.System, $"{existing.TrimEnd()}\n\n{addition.Trim()}");
     }
 
     private static IEnumerable<ChatMessage> SelectShortTermHistory(
@@ -558,6 +649,9 @@ public sealed class GoldfishHarnessRunner
         => string.IsNullOrWhiteSpace(category) ? string.Empty : $"/{category}";
 
     private async Task<ToolCallRecord> ExecuteFunctionCallAsync(
+        GoldfishHarnessRequest request,
+        string runId,
+        int step,
         FunctionCallContent functionCall,
         IReadOnlyDictionary<string, ToolFunction> toolFunctions,
         CancellationToken ct)
@@ -575,6 +669,32 @@ public sealed class GoldfishHarnessRunner
         }
 
         var arguments = SerializeArguments(functionCall.Arguments);
+        var startedAt = DateTimeOffset.UtcNow;
+        var authorization = await AuthorizeToolAsync(
+            request,
+            runId,
+            toolFunction.Tool,
+            arguments,
+            ct);
+        if (authorization.Decision != ToolAuthorizationDecision.Allow)
+        {
+            var authorizationRecord = BuildAuthorizationRecord(
+                functionCall.CallId,
+                toolFunction.Tool.Id,
+                arguments,
+                authorization);
+            await RecordToolExecutionAsync(
+                request,
+                runId,
+                step,
+                authorizationRecord,
+                startedAt,
+                authorization.Decision,
+                authorization.Reason,
+                ct);
+            return authorizationRecord;
+        }
+
         try
         {
             var result = await toolFunction.InvokeAsync(new AIFunctionArguments(functionCall.Arguments), ct);
@@ -590,7 +710,7 @@ public sealed class GoldfishHarnessRunner
             var serializedPayload = payload is string textPayload
                 ? CompactToolResult(textPayload)
                 : CompactToolResult(JsonSerializer.Serialize(payload, ToolArgumentJsonOptions));
-            return new ToolCallRecord
+            var record = new ToolCallRecord
             {
                 ToolCallId = functionCall.CallId,
                 ToolId = toolFunction.Tool.Id,
@@ -600,10 +720,20 @@ public sealed class GoldfishHarnessRunner
                 DisplayText = string.IsNullOrWhiteSpace(displayText) ? null : displayText,
                 Attachments = attachments
             };
+            await RecordToolExecutionAsync(
+                request,
+                runId,
+                step,
+                record,
+                startedAt,
+                ToolAuthorizationDecision.Allow,
+                null,
+                ct);
+            return record;
         }
         catch (Exception ex)
         {
-            return new ToolCallRecord
+            var record = new ToolCallRecord
             {
                 ToolCallId = functionCall.CallId,
                 ToolId = toolFunction.Tool.Id,
@@ -611,14 +741,79 @@ public sealed class GoldfishHarnessRunner
                 Result = ex.Message,
                 Success = false
             };
+            await RecordToolExecutionAsync(
+                request,
+                runId,
+                step,
+                record,
+                startedAt,
+                ToolAuthorizationDecision.Allow,
+                ex.Message,
+                ct);
+            return record;
         }
     }
 
-    private async Task<ToolCallRecord> ExecuteLegacyToolActionAsync(GoldfishAction action, string toolCallId, CancellationToken ct)
+    private async Task<ToolCallRecord> ExecuteLegacyToolActionAsync(
+        GoldfishHarnessRequest request,
+        string runId,
+        int step,
+        GoldfishAction action,
+        string toolCallId,
+        CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
+        var startedAt = DateTimeOffset.UtcNow;
+        var tool = _toolRegistry.GetById(action.Tool!);
+        if (tool == null)
+        {
+            var missingRecord = new ToolCallRecord
+            {
+                ToolCallId = toolCallId,
+                ToolId = action.Tool!,
+                Arguments = action.Arguments ?? "{}",
+                Result = $"Tool not found: {action.Tool}",
+                Success = false
+            };
+            await RecordToolExecutionAsync(
+                request,
+                runId,
+                step,
+                missingRecord,
+                startedAt,
+                ToolAuthorizationDecision.Deny,
+                missingRecord.Result,
+                ct);
+            return missingRecord;
+        }
+
+        var authorization = await AuthorizeToolAsync(
+            request,
+            runId,
+            tool,
+            action.Arguments ?? "{}",
+            ct);
+        if (authorization.Decision != ToolAuthorizationDecision.Allow)
+        {
+            var authorizationRecord = BuildAuthorizationRecord(
+                toolCallId,
+                tool.Id,
+                action.Arguments ?? "{}",
+                authorization);
+            await RecordToolExecutionAsync(
+                request,
+                runId,
+                step,
+                authorizationRecord,
+                startedAt,
+                authorization.Decision,
+                authorization.Reason,
+                ct);
+            return authorizationRecord;
+        }
+
         var toolResult = await _toolRegistry.ExecuteAsync(action.Tool!, action.Arguments ?? "{}");
-        return new ToolCallRecord
+        var record = new ToolCallRecord
         {
             ToolCallId = toolCallId,
             ToolId = action.Tool!,
@@ -628,6 +823,94 @@ public sealed class GoldfishHarnessRunner
             DisplayText = string.IsNullOrWhiteSpace(toolResult.DisplayText) ? null : toolResult.DisplayText,
             Attachments = toolResult.Attachments
         };
+        await RecordToolExecutionAsync(
+            request,
+            runId,
+            step,
+            record,
+            startedAt,
+            ToolAuthorizationDecision.Allow,
+            toolResult.Success ? null : record.Result,
+            ct);
+        return record;
+    }
+
+    private static async ValueTask<ToolAuthorizationResult> AuthorizeToolAsync(
+        GoldfishHarnessRequest request,
+        string runId,
+        ITool tool,
+        string arguments,
+        CancellationToken ct)
+    {
+        var hook = request.ToolAuthorizationHook ?? AllowAllToolAuthorizationHook.Instance;
+        var context = GoldfishRunContext.FromAgentInfo(request.AgentInfo, request.SessionId, request.DisableConfigCache);
+        return await hook.AuthorizeAsync(new ToolAuthorizationRequest
+        {
+            RunId = runId,
+            SessionId = request.SessionId,
+            TenantId = GetExtra(request.AgentInfo, "TenantId"),
+            UserId = context.User.Id,
+            AgentId = context.Agent.Id,
+            WorkspaceId = GetExtra(request.AgentInfo, "WorkspaceId"),
+            ToolId = tool.Id,
+            ToolName = tool.Name,
+            Arguments = arguments
+        }, ct);
+    }
+
+    private static ToolCallRecord BuildAuthorizationRecord(
+        string? toolCallId,
+        string toolId,
+        string arguments,
+        ToolAuthorizationResult authorization)
+    {
+        var message = authorization.Decision == ToolAuthorizationDecision.RequireApproval
+            ? $"Tool authorization required: {authorization.Reason ?? "user approval required"}"
+            : $"Tool authorization denied: {authorization.Reason ?? "not allowed"}";
+        return new ToolCallRecord
+        {
+            ToolCallId = toolCallId,
+            ToolId = toolId,
+            Arguments = arguments,
+            Result = message,
+            Success = false,
+            DisplayText = authorization.Decision == ToolAuthorizationDecision.RequireApproval
+                ? $"需要用户授权后才能执行工具 {toolId}。ApprovalRequestId={authorization.ApprovalRequestId ?? string.Empty}"
+                : $"工具 {toolId} 已被授权策略拒绝：{authorization.Reason ?? "not allowed"}"
+        };
+    }
+
+    private static async Task RecordToolExecutionAsync(
+        GoldfishHarnessRequest request,
+        string runId,
+        int step,
+        ToolCallRecord record,
+        DateTimeOffset startedAt,
+        ToolAuthorizationDecision authorizationDecision,
+        string? error,
+        CancellationToken ct)
+    {
+        var store = request.ToolExecutionStore ?? NullToolExecutionStore.Instance;
+        var context = GoldfishRunContext.FromAgentInfo(request.AgentInfo, request.SessionId, request.DisableConfigCache);
+        await store.RecordAsync(new ToolExecutionRecord
+        {
+            RunId = runId,
+            SessionId = request.SessionId,
+            TenantId = GetExtra(request.AgentInfo, "TenantId"),
+            UserId = context.User.Id,
+            AgentId = context.Agent.Id,
+            WorkspaceId = GetExtra(request.AgentInfo, "WorkspaceId"),
+            Step = step,
+            ToolCallId = record.ToolCallId,
+            ToolId = record.ToolId,
+            ArgumentsHash = ToolExecutionHash.Sha256(record.Arguments),
+            ResultHash = string.IsNullOrWhiteSpace(record.Result) ? null : ToolExecutionHash.Sha256(record.Result),
+            Success = record.Success,
+            Error = error,
+            AuthorizationDecision = authorizationDecision.ToString(),
+            StartedAt = startedAt,
+            CompletedAt = DateTimeOffset.UtcNow
+        }, ct);
     }
 
     private static string BuildLegacyToolCallId(int step, string toolId)
@@ -1084,7 +1367,10 @@ public sealed record GoldfishHarnessRequest(
     MemoryOptions? MemoryOptions = null,
     MemoryContext? MemoryContext = null,
     IGoldfishSteerSource? SteerSource = null,
-    SkillOptions? SkillOptions = null);
+    SkillOptions? SkillOptions = null,
+    ISkillSessionStore? SkillSessionStore = null,
+    IToolExecutionStore? ToolExecutionStore = null,
+    IToolAuthorizationHook? ToolAuthorizationHook = null);
 
 public interface IGoldfishSteerSource
 {

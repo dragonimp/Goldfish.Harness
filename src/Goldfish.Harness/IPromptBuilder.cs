@@ -64,23 +64,18 @@ public class PromptBuilder : IPromptBuilder
     {
         var messages = new List<ChatMessage>();
 
-        // 添加系统消息
         var systemPrompt = BuildSystemPrompt(agent);
+        var memoryPrompt = BuildMemoryPrompt(memoryContext);
+        if (!string.IsNullOrWhiteSpace(memoryPrompt))
+        {
+            systemPrompt = $"{systemPrompt.TrimEnd()}\n\n{memoryPrompt}";
+        }
+
         messages.Add(new ChatMessage
         {
             Role = "system",
             Content = systemPrompt
         });
-
-        var memoryPrompt = BuildMemoryPrompt(memoryContext);
-        if (!string.IsNullOrWhiteSpace(memoryPrompt))
-        {
-            messages.Add(new ChatMessage
-            {
-                Role = "system",
-                Content = memoryPrompt
-            });
-        }
 
         foreach (var msg in memoryContext.ShortTermMessages)
         {
