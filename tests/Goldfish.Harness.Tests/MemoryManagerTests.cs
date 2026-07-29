@@ -77,6 +77,40 @@ public sealed class MemoryManagerTests
     }
 
     [Fact]
+    public async Task BuildContext_CompressesWhenEstimatedTokensExceedThreshold()
+    {
+        var manager = new InMemoryMemoryManager();
+        for (var i = 0; i < 6; i++)
+        {
+            await manager.AddMessageAsync("session-token-budget", new ChatMessage
+            {
+                Role = "user",
+                Content = new string('长', 160) + i
+            });
+        }
+
+        var context = await manager.BuildContextAsync(
+            "session-token-budget",
+            "继续",
+            new MemoryOptions
+            {
+                MediumTerm =
+                {
+                    CompressionThresholdMessages = 100,
+                    CompressionThresholdEstimatedTokens = 120,
+                    RetainRecentMessages = 2,
+                    MaxSummaries = 3,
+                    EstimatedCharsPerToken = 2.0
+                },
+                LongTerm = { Enabled = false }
+            });
+
+        Assert.Equal(2, context.ShortTermMessages.Count);
+        var summary = Assert.Single(context.MediumTermMemories);
+        Assert.Equal("ConversationSummary", summary.Type);
+    }
+
+    [Fact]
     public async Task EmbeddingClient_SendsOpenAiCompatibleRequestAndInputType()
     {
         string? requestJson = null;

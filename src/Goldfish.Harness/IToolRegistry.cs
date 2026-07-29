@@ -17,7 +17,7 @@ public class ToolResult
     /// <summary>给模型和 UI 的可读展示文本。工具自带时优先于对 Data 的反向格式化。</summary>
     public string? DisplayText { get; set; }
 
-    /// <summary>给网关文件发送链路的附件（如 [GatewayFile] 标记或附件对象）。</summary>
+    /// <summary>给宿主文件发送链路的附件（如文件标记或附件对象）。</summary>
     public IReadOnlyList<object>? Attachments { get; set; }
 
     /// <summary>给 trace/调试的元信息（耗时等）。</summary>

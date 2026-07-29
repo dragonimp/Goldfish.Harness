@@ -335,6 +335,43 @@ public sealed class SqliteMemoryManagerTests
     }
 
     [Fact]
+    public async Task BuildContext_CompressesPersistedMessagesWhenEstimatedTokensExceedThreshold()
+    {
+        var databasePath = CreateDatabasePath();
+        try
+        {
+            var manager = new SqliteMemoryManager(
+                new SqliteMemoryOptions { Enabled = true, DatabasePath = databasePath });
+            for (var i = 0; i < 6; i++)
+                await manager.AddMessageAsync("session-token-budget", Message(new string('长', 160) + i));
+
+            var context = await manager.BuildContextAsync(
+                "session-token-budget",
+                "继续",
+                new MemoryOptions
+                {
+                    MediumTerm =
+                    {
+                        CompressionThresholdMessages = 100,
+                        CompressionThresholdEstimatedTokens = 120,
+                        RetainRecentMessages = 2,
+                        MaxSummaries = 3,
+                        EstimatedCharsPerToken = 2.0
+                    },
+                    LongTerm = { Enabled = false }
+                });
+
+            Assert.Equal(2, context.ShortTermMessages.Count);
+            var summary = Assert.Single(context.MediumTermMemories);
+            Assert.Contains("会话片段摘要", summary.Content);
+        }
+        finally
+        {
+            DeleteDatabase(databasePath);
+        }
+    }
+
+    [Fact]
     public async Task DeleteSession_RemovesShortAndMediumButKeepsLongTerm()
     {
         var databasePath = CreateDatabasePath();

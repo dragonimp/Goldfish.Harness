@@ -116,6 +116,10 @@ public sealed class MediumTermMemoryOptions
 {
     public bool Enabled { get; set; } = true;
     public int CompressionThresholdMessages { get; set; } = 24;
+    public int CompressionThresholdEstimatedTokens { get; set; } = 0;
+    public int MaxEstimatedInputTokens { get; set; } = 0;
+    public int OutputTokenReserve { get; set; } = 0;
+    public double EstimatedCharsPerToken { get; set; } = 4.0;
     public int RetainRecentMessages { get; set; } = 8;
     public int MaxSummaries { get; set; } = 3;
     public int MaxSummaryChars { get; set; } = 2000;
@@ -124,6 +128,50 @@ public sealed class MediumTermMemoryOptions
         "user",
         "assistant"
     };
+}
+
+public static class ContextTokenEstimator
+{
+    private const int PerMessageOverheadTokens = 4;
+
+    public static int EstimateMessageTokens(
+        IEnumerable<ChatMessage> messages,
+        double estimatedCharsPerToken = 4.0)
+        => messages.Sum(message => EstimateTextTokens(message.Role, estimatedCharsPerToken)
+            + EstimateTextTokens(message.Content, estimatedCharsPerToken)
+            + EstimateTextTokens(message.ToolCallId, estimatedCharsPerToken)
+            + PerMessageOverheadTokens);
+
+    public static int EstimatePromptTokens(
+        IEnumerable<Microsoft.Extensions.AI.ChatMessage> messages,
+        double estimatedCharsPerToken = 4.0)
+        => messages.Sum(message => EstimateTextTokens(message.Text, estimatedCharsPerToken) + PerMessageOverheadTokens);
+
+    public static int EstimateTextTokens(string? text, double estimatedCharsPerToken = 4.0)
+    {
+        if (string.IsNullOrEmpty(text)) return 0;
+        var charsPerToken = estimatedCharsPerToken > 0 ? estimatedCharsPerToken : 4.0;
+        return Math.Max(1, (int)Math.Ceiling(text.Length / charsPerToken));
+    }
+
+    public static int EffectiveInputBudget(MediumTermMemoryOptions options)
+    {
+        if (options.MaxEstimatedInputTokens <= 0) return 0;
+        return Math.Max(1, options.MaxEstimatedInputTokens - Math.Max(0, options.OutputTokenReserve));
+    }
+
+    public static bool ExceedsCompressionBudget(
+        IEnumerable<ChatMessage> messages,
+        MediumTermMemoryOptions options,
+        int extraEstimatedTokens = 0)
+    {
+        var estimated = EstimateMessageTokens(messages, options.EstimatedCharsPerToken)
+            + Math.Max(0, extraEstimatedTokens);
+        var threshold = options.CompressionThresholdEstimatedTokens;
+        var budget = EffectiveInputBudget(options);
+        return (threshold > 0 && estimated > threshold)
+            || (budget > 0 && estimated > budget);
+    }
 }
 
 public sealed class LongTermMemoryOptions
@@ -499,7 +547,9 @@ public class InMemoryMemoryManager : IMemoryManager
         lock (_lock)
         {
             shouldCompress = _sessions.TryGetValue(sessionId, out var messages)
-                && messages.Count > Math.Max(options.RetainRecentMessages, options.CompressionThresholdMessages);
+                && messages.Count > Math.Max(1, options.RetainRecentMessages)
+                && (messages.Count > Math.Max(options.RetainRecentMessages, options.CompressionThresholdMessages)
+                    || ContextTokenEstimator.ExceedsCompressionBudget(messages, options));
         }
 
         if (shouldCompress)

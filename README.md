@@ -48,13 +48,11 @@ var memoryOptions = configuration
 IMemoryManager memoryManager = memoryOptions.Sqlite.Enabled
     ? SqliteMemoryManager.FromOptions(memoryOptions, httpClient)
     : InMemoryMemoryManager.FromOptions(memoryOptions, httpClient);
-var agent = new AgenticLoopEngine(
-    agentInfo,
-    chatClient,
-    toolRegistry,
-    memoryManager,
-    promptBuilder,
-    memoryOptions: memoryOptions);
+using var chatClient = new WhitespacePreservingOpenAiChatClient(
+    baseUrl,
+    apiKey,
+    model);
+var runner = new GoldfishHarnessRunner(chatClient, toolRegistry);
 ```
 
 When the endpoint cannot be reached, `FallbackToLexicalSearch=true` keeps the
@@ -135,6 +133,30 @@ credential-looking content. Content hashes deduplicate equivalent memories
 within a partition, and explicit IDs cannot overwrite another partition.
 Retrieval excludes expired or low-confidence entries and reranks candidates with
 semantic similarity, importance, freshness, and confidence.
+
+### Context compression triggers
+
+Medium-term compression can trigger by either message count or estimated request
+size. Configure `Goldfish:Memory:MediumTerm` with an estimated model input
+budget when the host knows the upstream context limit:
+
+```json
+{
+  "CompressionThresholdMessages": 24,
+  "CompressionThresholdEstimatedTokens": 12000,
+  "MaxEstimatedInputTokens": 16000,
+  "OutputTokenReserve": 2048,
+  "EstimatedCharsPerToken": 4.0,
+  "RetainRecentMessages": 8
+}
+```
+
+`BuildContextAsync` checks the persisted short-term messages before retrieval.
+If the message count or estimated input size is over budget, older messages are
+compressed into medium-term summaries and the most recent messages are retained.
+`GoldfishHarnessRunner` also applies the same estimated input budget while
+building the request, trimming oldest short-term history when the caller
+provides raw history without first using a memory manager.
 
 ## Skills, tool traces, and authorization
 

@@ -485,7 +485,22 @@ public sealed partial class SqliteMemoryManager : IMemoryManager
             """;
         AddPartitionParameters(command, partition);
         var count = Convert.ToInt32(await command.ExecuteScalarAsync(), CultureInfo.InvariantCulture);
+        if (count <= Math.Max(1, options.RetainRecentMessages))
+            return;
+
         if (count > Math.Max(options.RetainRecentMessages, options.CompressionThresholdMessages))
+        {
+            await CompressAsync(partition, options);
+            return;
+        }
+
+        if (options.CompressionThresholdEstimatedTokens <= 0 && options.MaxEstimatedInputTokens <= 0)
+            return;
+
+        var messages = (await LoadMessagesAsync(connection, partition))
+            .Select(item => item.Message)
+            .ToList();
+        if (ContextTokenEstimator.ExceedsCompressionBudget(messages, options))
             await CompressAsync(partition, options);
     }
 

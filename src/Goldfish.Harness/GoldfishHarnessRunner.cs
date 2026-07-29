@@ -1,5 +1,5 @@
-using System.Text;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
@@ -19,6 +19,7 @@ public sealed class GoldfishHarnessRunner
     private readonly IChatClient _chatClient;
     private readonly IToolRegistry _toolRegistry;
     private readonly ISkillRegistry? _skillRegistry;
+    private readonly IReasoningStrategyDecider _reasoningStrategyDecider;
     private readonly ILogger<GoldfishHarnessRunner> _logger;
     private readonly int _maxHistoryMessages;
     private readonly int _maxReactSteps;
@@ -39,12 +40,14 @@ public sealed class GoldfishHarnessRunner
         ILogger<GoldfishHarnessRunner>? logger = null,
         int maxHistoryMessages = DefaultMaxHistoryMessages,
         int maxReactSteps = DefaultMaxReactSteps,
-        ISkillRegistry? skillRegistry = null)
+        ISkillRegistry? skillRegistry = null,
+        IReasoningStrategyDecider? reasoningStrategyDecider = null)
     {
         _chatClient = chatClient;
         _toolRegistry = toolRegistry;
         _skillRegistry = skillRegistry;
         _logger = logger ?? NullLogger<GoldfishHarnessRunner>.Instance;
+        _reasoningStrategyDecider = reasoningStrategyDecider ?? new DefaultReasoningStrategyDecider(_chatClient, _logger);
         _maxHistoryMessages = Math.Max(1, maxHistoryMessages);
         _maxReactSteps = Math.Max(1, maxReactSteps);
     }
@@ -55,16 +58,44 @@ public sealed class GoldfishHarnessRunner
     {
         var runId = Guid.NewGuid().ToString("n");
         var skillOptions = request.SkillOptions ?? SkillOptions.Default;
+        var reasoningSelection = await SelectReasoningStrategyAsync(request, ct);
         var skillState = new SkillRuntimeState(skillOptions);
         await RestoreSessionSkillsAsync(request, skillState, skillOptions, ct);
         var internalTools = BuildInternalTools(request, skillState, skillOptions);
         var toolFunctions = BuildToolFunctions(BuildEffectiveTools(_toolRegistry.GetAll(), internalTools, skillState, skillOptions));
-        var messages = BuildMessages(request, skillState);
+        var messages = BuildMessages(request, skillState, reasoningSelection);
         var result = new GoldfishHarnessRunResult();
+        result.Events.Add(GoldfishHarnessEvent.ReasoningStrategySelected(reasoningSelection));
+        var plan = await CreatePlanIfNeededAsync(request, reasoningSelection, messages, ct);
+        if (plan is not null)
+        {
+            result.Events.Add(GoldfishHarnessEvent.PlanCreated(plan));
+            AppendPlanToLeadingSystemMessage(messages, plan);
+        }
+        var reWooGraph = await CreateReWooGraphIfNeededAsync(request, reasoningSelection, messages, toolFunctions, ct);
+        if (reWooGraph is not null)
+        {
+            result.Events.Add(GoldfishHarnessEvent.ReWooGraphCreated(reWooGraph));
+            AppendReWooGraphToLeadingSystemMessage(messages, reWooGraph);
+            var graphRecords = await ExecuteReWooGraphAsync(request, runId, reWooGraph, toolFunctions, ct);
+            foreach (var record in graphRecords)
+            {
+                result.ToolCalls.Add(record);
+                result.Events.Add(GoldfishHarnessEvent.ToolCall(0, record));
+                result.Events.Add(GoldfishHarnessEvent.ToolResult(0, record));
+            }
+            AppendReWooObservations(messages, graphRecords);
+        }
         _logger.LogInformation("Goldfish Harness starting. tools={ToolCount}, model tools mode={ToolMode}", toolFunctions.Count, toolFunctions.Count > 0 ? "native" : "none");
 
         for (var step = 1; step <= _maxReactSteps; step++)
         {
+            var planStep = GetPlanStep(plan, step);
+            if (planStep is not null)
+            {
+                result.Events.Add(GoldfishHarnessEvent.PlanStepStarted(planStep));
+            }
+
             toolFunctions = BuildToolFunctions(BuildEffectiveTools(_toolRegistry.GetAll(), internalTools, skillState, skillOptions));
             var steers = await DrainSteersAsync(request, messages, step, ct);
             if (steers.Count > 0)
@@ -97,6 +128,23 @@ public sealed class GoldfishHarnessRunner
                         ChatRole.Tool,
                         [new FunctionResultContent(functionCall.CallId, BuildFunctionResultPayload(record))]));
                     AppendLoadedSkillPromptIfNeeded(messages, record, skillState);
+                    if (TryCreateRequiredRetryCall(record, toolFunctions, step, out var retryCall))
+                    {
+                        var retryRecord = await ExecuteFunctionCallAsync(request, runId, step, retryCall, toolFunctions, ct);
+                        result.ToolCalls.Add(retryRecord);
+                        result.Events.Add(GoldfishHarnessEvent.ToolCall(step, retryRecord));
+                        result.Events.Add(GoldfishHarnessEvent.ToolResult(step, retryRecord));
+                        messages.Add(new MsChatMessage(
+                            ChatRole.Assistant,
+                            [retryCall]));
+                        messages.Add(new MsChatMessage(
+                            ChatRole.Tool,
+                            [new FunctionResultContent(retryCall.CallId, BuildFunctionResultPayload(retryRecord))]));
+                    }
+                }
+                if (planStep is not null)
+                {
+                    result.Events.Add(GoldfishHarnessEvent.PlanStepCompleted(planStep, "工具观察已加入上下文。"));
                 }
                 continue;
             }
@@ -116,6 +164,10 @@ public sealed class GoldfishHarnessRunner
                 result.Events.Add(GoldfishHarnessEvent.ToolResult(step, record));
                 messages.Add(new MsChatMessage(ChatRole.Assistant, raw));
                 messages.Add(new MsChatMessage(ChatRole.User, BuildObservationPrompt(record)));
+                if (planStep is not null)
+                {
+                    result.Events.Add(GoldfishHarnessEvent.PlanStepCompleted(planStep, "工具观察已加入上下文。"));
+                }
                 continue;
             }
 
@@ -124,6 +176,34 @@ public sealed class GoldfishHarnessRunner
             {
                 result.Answer = "[Goldfish 无输出]";
             }
+            if (IsFinalTextOnly(request)
+                && (RequiresToolBeforeFinal(request, result.ToolCalls.Count > 0)
+                    || ShouldContinueFinalTextOnly(result.Answer, toolFunctions.Count > 0)))
+            {
+                messages.Add(new MsChatMessage(ChatRole.Assistant, raw));
+                messages.Add(new MsChatMessage(
+                    ChatRole.User,
+                    RequiresToolBeforeFinal(request, result.ToolCalls.Count > 0)
+                        ? BuildRequiredToolCorrection()
+                        : BuildFinalTextCorrection(result.Answer)));
+                result.Answer = string.Empty;
+                continue;
+            }
+            if (planStep is not null)
+            {
+                result.Events.Add(GoldfishHarnessEvent.PlanStepCompleted(planStep, "已生成最终回答。"));
+            }
+            if (plan is not null)
+            {
+                result.Events.AddRange(CompleteRemainingPlanSteps(plan, step));
+            }
+            var reflection = await ReflectFinalAnswerIfNeededAsync(request, reasoningSelection, messages, result.Answer, ct);
+            if (reflection is not null)
+            {
+                result.Answer = reflection.Answer;
+                result.Events.Add(GoldfishHarnessEvent.ReflectionCompleted(reflection));
+            }
+            AddReasoningTraceCompletedEvent(result);
             return result;
         }
 
@@ -135,6 +215,23 @@ public sealed class GoldfishHarnessRunner
         {
             result.Answer = "已达到 Goldfish 最大推理轮次，但没有生成可用最终回答。";
         }
+        var finalReflection = await ReflectFinalAnswerIfNeededAsync(request, reasoningSelection, messages, result.Answer, ct);
+        if (finalReflection is not null)
+        {
+            result.Answer = finalReflection.Answer;
+            result.Events.Add(GoldfishHarnessEvent.ReflectionCompleted(finalReflection));
+        }
+        if (plan is not null)
+        {
+            var pendingStep = plan.Steps.FirstOrDefault(step => step.Index > _maxReactSteps);
+            if (pendingStep is not null)
+            {
+                result.Events.Add(GoldfishHarnessEvent.PlanStepFailed(
+                    pendingStep,
+                    "已达到最大推理轮次。"));
+            }
+        }
+        AddReasoningTraceCompletedEvent(result);
         return result;
     }
 
@@ -157,16 +254,58 @@ public sealed class GoldfishHarnessRunner
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         var skillOptions = request.SkillOptions ?? SkillOptions.Default;
+        var reasoningSelection = await SelectReasoningStrategyAsync(request, ct);
         var skillState = new SkillRuntimeState(skillOptions);
         await RestoreSessionSkillsAsync(request, skillState, skillOptions, ct);
         var internalTools = BuildInternalTools(request, skillState, skillOptions);
         var toolFunctions = BuildToolFunctions(BuildEffectiveTools(_toolRegistry.GetAll(), internalTools, skillState, skillOptions));
-        var messages = BuildMessages(request, skillState);
+        var messages = BuildMessages(request, skillState, reasoningSelection);
         _logger.LogInformation("Goldfish Harness streaming. tools={ToolCount}, model tools mode={ToolMode}", toolFunctions.Count, toolFunctions.Count > 0 ? "native" : "none");
         var toolWasUsed = false;
+        var finalTextOnly = IsFinalTextOnly(request);
+        var traceEvents = new List<GoldfishHarnessEvent>();
+        var strategySelectedEvent = GoldfishHarnessEvent.ReasoningStrategySelected(reasoningSelection);
+        traceEvents.Add(strategySelectedEvent);
+        yield return strategySelectedEvent;
+        var plan = await CreatePlanIfNeededAsync(request, reasoningSelection, messages, ct);
+        if (plan is not null)
+        {
+            var planCreatedEvent = GoldfishHarnessEvent.PlanCreated(plan);
+            traceEvents.Add(planCreatedEvent);
+            yield return planCreatedEvent;
+            AppendPlanToLeadingSystemMessage(messages, plan);
+        }
+        var reWooGraph = await CreateReWooGraphIfNeededAsync(request, reasoningSelection, messages, toolFunctions, ct);
+        if (reWooGraph is not null)
+        {
+            var graphCreatedEvent = GoldfishHarnessEvent.ReWooGraphCreated(reWooGraph);
+            traceEvents.Add(graphCreatedEvent);
+            yield return graphCreatedEvent;
+            AppendReWooGraphToLeadingSystemMessage(messages, reWooGraph);
+            var graphRecords = await ExecuteReWooGraphAsync(request, runId, reWooGraph, toolFunctions, ct);
+            foreach (var record in graphRecords)
+            {
+                toolWasUsed = toolWasUsed || record.Success;
+                var toolCallEvent = GoldfishHarnessEvent.ToolCall(0, record);
+                var toolResultEvent = GoldfishHarnessEvent.ToolResult(0, record);
+                traceEvents.Add(toolCallEvent);
+                traceEvents.Add(toolResultEvent);
+                yield return toolCallEvent;
+                yield return toolResultEvent;
+            }
+            AppendReWooObservations(messages, graphRecords);
+        }
 
         for (var step = 1; step <= _maxReactSteps; step++)
         {
+            var planStep = GetPlanStep(plan, step);
+            if (planStep is not null)
+            {
+                var planStepStartedEvent = GoldfishHarnessEvent.PlanStepStarted(planStep);
+                traceEvents.Add(planStepStartedEvent);
+                yield return planStepStartedEvent;
+            }
+
             toolFunctions = BuildToolFunctions(BuildEffectiveTools(_toolRegistry.GetAll(), internalTools, skillState, skillOptions));
             var steers = await DrainSteersAsync(request, messages, step, ct);
             if (steers.Count > 0)
@@ -179,7 +318,7 @@ public sealed class GoldfishHarnessRunner
             var updates = new List<ChatResponseUpdate>();
             var rawBuilder = new StringBuilder();
             var pendingTextBuilder = new StringBuilder();
-            bool? streamTextDirectly = toolWasUsed ? false : null;
+            bool? streamTextDirectly = finalTextOnly || toolWasUsed ? false : null;
             await foreach (var update in _chatClient.GetStreamingResponseAsync(messages, BuildChatOptions(request, toolFunctions), ct))
             {
                 updates.Add(update);
@@ -244,18 +383,48 @@ public sealed class GoldfishHarnessRunner
 
                 foreach (var functionCall in functionCalls)
                 {
-                    yield return GoldfishHarnessEvent.ToolCallStart(
+                    var toolCallStartEvent = GoldfishHarnessEvent.ToolCallStart(
                         step,
                         functionCall.Name,
                         SerializeArguments(functionCall.Arguments),
                         functionCall.CallId);
+                    traceEvents.Add(toolCallStartEvent);
+                    yield return toolCallStartEvent;
                     var record = await ExecuteFunctionCallAsync(request, runId, step, functionCall, toolFunctions, ct);
                     toolWasUsed = true;
-                    yield return GoldfishHarnessEvent.ToolResult(step, record);
+                    var toolResultEvent = GoldfishHarnessEvent.ToolResult(step, record);
+                    traceEvents.Add(toolResultEvent);
+                    yield return toolResultEvent;
                     messages.Add(new MsChatMessage(
                         ChatRole.Tool,
                         [new FunctionResultContent(functionCall.CallId, BuildFunctionResultPayload(record))]));
                     AppendLoadedSkillPromptIfNeeded(messages, record, skillState);
+                    if (TryCreateRequiredRetryCall(record, toolFunctions, step, out var retryCall))
+                    {
+                        var retryCallStartEvent = GoldfishHarnessEvent.ToolCallStart(
+                            step,
+                            retryCall.Name,
+                            SerializeArguments(retryCall.Arguments),
+                            retryCall.CallId);
+                        traceEvents.Add(retryCallStartEvent);
+                        yield return retryCallStartEvent;
+                        var retryRecord = await ExecuteFunctionCallAsync(request, runId, step, retryCall, toolFunctions, ct);
+                        var retryResultEvent = GoldfishHarnessEvent.ToolResult(step, retryRecord);
+                        traceEvents.Add(retryResultEvent);
+                        yield return retryResultEvent;
+                        messages.Add(new MsChatMessage(
+                            ChatRole.Assistant,
+                            [retryCall]));
+                        messages.Add(new MsChatMessage(
+                            ChatRole.Tool,
+                            [new FunctionResultContent(retryCall.CallId, BuildFunctionResultPayload(retryRecord))]));
+                    }
+                }
+                if (planStep is not null)
+                {
+                    var planStepCompletedEvent = GoldfishHarnessEvent.PlanStepCompleted(planStep, "工具观察已加入上下文。");
+                    traceEvents.Add(planStepCompletedEvent);
+                    yield return planStepCompletedEvent;
                 }
                 continue;
             }
@@ -269,12 +438,22 @@ public sealed class GoldfishHarnessRunner
             if (action.Kind == GoldfishActionKind.Tool && !string.IsNullOrWhiteSpace(action.Tool))
             {
                 var legacyToolCallId = BuildLegacyToolCallId(step, action.Tool!);
-                yield return GoldfishHarnessEvent.ToolCallStart(step, action.Tool!, action.Arguments ?? "{}", legacyToolCallId);
+                var toolCallStartEvent = GoldfishHarnessEvent.ToolCallStart(step, action.Tool!, action.Arguments ?? "{}", legacyToolCallId);
+                traceEvents.Add(toolCallStartEvent);
+                yield return toolCallStartEvent;
                 var record = await ExecuteLegacyToolActionAsync(request, runId, step, action, legacyToolCallId, ct);
                 toolWasUsed = true;
-                yield return GoldfishHarnessEvent.ToolResult(step, record);
+                var toolResultEvent = GoldfishHarnessEvent.ToolResult(step, record);
+                traceEvents.Add(toolResultEvent);
+                yield return toolResultEvent;
                 messages.Add(new MsChatMessage(ChatRole.Assistant, raw));
                 messages.Add(new MsChatMessage(ChatRole.User, BuildObservationPrompt(record)));
+                if (planStep is not null)
+                {
+                    var planStepCompletedEvent = GoldfishHarnessEvent.PlanStepCompleted(planStep, "工具观察已加入上下文。");
+                    traceEvents.Add(planStepCompletedEvent);
+                    yield return planStepCompletedEvent;
+                }
                 continue;
             }
 
@@ -283,9 +462,49 @@ public sealed class GoldfishHarnessRunner
             {
                 answer = "[Goldfish 无输出]";
             }
+            if (finalTextOnly
+                && (RequiresToolBeforeFinal(request, toolWasUsed)
+                    || ShouldContinueFinalTextOnly(answer, toolFunctions.Count > 0)))
+            {
+                messages.Add(new MsChatMessage(ChatRole.Assistant, raw));
+                messages.Add(new MsChatMessage(
+                    ChatRole.User,
+                    RequiresToolBeforeFinal(request, toolWasUsed)
+                        ? BuildRequiredToolCorrection()
+                        : BuildFinalTextCorrection(answer)));
+                yield return GoldfishHarnessEvent.Thinking(step, "检测到过程占位话术，继续完成任务后再输出最终答复。");
+                continue;
+            }
+            if (planStep is not null)
+            {
+                var planStepCompletedEvent = GoldfishHarnessEvent.PlanStepCompleted(planStep, "已生成最终回答。");
+                traceEvents.Add(planStepCompletedEvent);
+                yield return planStepCompletedEvent;
+            }
+            if (plan is not null)
+            {
+                foreach (var remainingEvent in CompleteRemainingPlanSteps(plan, step))
+                {
+                    traceEvents.Add(remainingEvent);
+                    yield return remainingEvent;
+                }
+            }
+            var reflection = await ReflectFinalAnswerIfNeededAsync(request, reasoningSelection, messages, answer, ct);
+            if (reflection is not null)
+            {
+                answer = reflection.Answer;
+                var reflectionEvent = GoldfishHarnessEvent.ReflectionCompleted(reflection);
+                traceEvents.Add(reflectionEvent);
+                yield return reflectionEvent;
+            }
             if (!string.IsNullOrWhiteSpace(answer) && streamTextDirectly != true)
             {
                 yield return GoldfishHarnessEvent.Text(step, answer);
+            }
+            var traceCompletedEvent = GoldfishHarnessEvent.ReasoningTraceCompleted(traceEvents);
+            if (!string.IsNullOrWhiteSpace(traceCompletedEvent.Delta))
+            {
+                yield return traceCompletedEvent;
             }
             yield return GoldfishHarnessEvent.Completed(step, answer);
             yield break;
@@ -308,7 +527,418 @@ public sealed class GoldfishHarnessRunner
                 yield return GoldfishHarnessEvent.Text(_maxReactSteps + 1, textDelta);
             }
         }
+        if (plan is not null)
+        {
+            var pendingStep = plan.Steps.FirstOrDefault(step => step.Index > _maxReactSteps);
+            if (pendingStep is not null)
+            {
+                var planStepFailedEvent = GoldfishHarnessEvent.PlanStepFailed(
+                    pendingStep,
+                    "已达到最大推理轮次。");
+                traceEvents.Add(planStepFailedEvent);
+                yield return planStepFailedEvent;
+            }
+        }
+        var finalTraceCompletedEvent = GoldfishHarnessEvent.ReasoningTraceCompleted(traceEvents);
+        if (!string.IsNullOrWhiteSpace(finalTraceCompletedEvent.Delta))
+        {
+            yield return finalTraceCompletedEvent;
+        }
         yield return GoldfishHarnessEvent.Completed(_maxReactSteps + 1, string.Empty);
+    }
+
+    private static bool IsFinalTextOnly(GoldfishHarnessRequest request)
+        => request.AgentInfo.ExtraData.TryGetValue("RuntimeResponseMode", out var mode)
+            && string.Equals(mode, "final_text_only", StringComparison.OrdinalIgnoreCase);
+
+    private static void AddReasoningTraceCompletedEvent(GoldfishHarnessRunResult result)
+    {
+        if (result.Events.Any(ev => ev.Kind == GoldfishEventKind.ReasoningTraceCompleted))
+        {
+            return;
+        }
+
+        var trace = GoldfishHarnessEvent.ReasoningTraceCompleted(result.Events);
+        if (!string.IsNullOrWhiteSpace(trace.Delta))
+        {
+            result.Events.Add(trace);
+        }
+    }
+
+    private static bool RequiresToolBeforeFinal(GoldfishHarnessRequest request, bool toolWasUsed)
+        => !toolWasUsed
+            && request.AgentInfo.ExtraData.TryGetValue("GoldfishRequireToolBeforeFinal", out var required)
+            && bool.TryParse(required, out var enabled)
+            && enabled;
+
+    private static string BuildRequiredToolCorrection()
+        => """
+[Skill 工具执行约束]
+当前是查询型语音请求，活动 Skill 已声明结果必须来自工具，但本轮尚未调用任何工具，因此不能输出 final。现在必须调用最合适的只读查询工具；拿到结果后再输出可直接播报的最终答案。
+""";
+
+    private static bool IsProvisionalFinalAnswer(string? answer)
+    {
+        if (string.IsNullOrWhiteSpace(answer)) return false;
+        var compact = Regex.Replace(answer, @"\s+", string.Empty);
+        if (compact.Length > 80) return false;
+        return Regex.IsMatch(
+            compact,
+            @"(正在.*(查询|查找|查一下|处理|确认|获取|为您查)|请稍等|稍等一下|我(先|来|马上).*(查询|查找|查一下|处理|确认|获取)|马上为您.*(查询|查找|处理))",
+            RegexOptions.CultureInvariant);
+    }
+
+    private static bool ShouldContinueFinalTextOnly(string? answer, bool hasTools)
+        => IsProvisionalFinalAnswer(answer)
+            || (hasTools && IsUnresolvedNotFoundAnswer(answer));
+
+    private static bool IsUnresolvedNotFoundAnswer(string? answer)
+    {
+        if (string.IsNullOrWhiteSpace(answer)) return false;
+        var compact = Regex.Replace(answer, @"\s+", string.Empty);
+        if (compact.Length > 160) return false;
+        return Regex.IsMatch(
+            compact,
+            @"(没有找到|未找到|查不到|不存在).*(名字|名称|孩子|成员|用户|记录|信息)|请.*(添加|确认).*(名字|名称|姓名|信息)",
+            RegexOptions.CultureInvariant);
+    }
+
+    private static string BuildFinalTextCorrection(string answer)
+        => IsUnresolvedNotFoundAnswer(answer)
+            ? """
+[通道最终答复校验]
+当前“未找到”只代表刚才的精确查询没有命中，不能直接作为最终答复。请继续遵守已加载 Skill：调用可用的列表、候选或查询工具获取完整候选，按标准名称、昵称、近音和错别字匹配；只有完成候选核对后，才能播报结果或请用户确认多个候选。
+"""
+            : """
+[通道最终答复校验]
+上一条只是执行过程或等待话术，不能作为最终答复。不要再次说“正在查询”“请稍等”或“我先查一下”。请继续完成必要的工具调用，并只在拿到工具结果后输出可直接播报的最终答案；如果工具失败，直接说明实际失败原因。
+""";
+
+    private static bool TryCreateRequiredRetryCall(
+        ToolCallRecord record,
+        IReadOnlyDictionary<string, ToolFunction> toolFunctions,
+        int step,
+        out FunctionCallContent retryCall)
+    {
+        retryCall = null!;
+        if (string.IsNullOrWhiteSpace(record.Result)) return false;
+        try
+        {
+            using var document = JsonDocument.Parse(record.Result);
+            var root = document.RootElement;
+            if (!root.TryGetProperty("structuredContent", out var structured)
+                || !structured.TryGetProperty("requires_child_list_retry", out var required)
+                || required.ValueKind != JsonValueKind.True
+                || !structured.TryGetProperty("retry_tool", out var retryToolElement))
+            {
+                return false;
+            }
+
+            var retryTool = retryToolElement.GetString();
+            if (string.IsNullOrWhiteSpace(retryTool)) return false;
+            var function = toolFunctions.FirstOrDefault(item =>
+                string.Equals(item.Key, retryTool, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(item.Value.Tool.Id, retryTool, StringComparison.OrdinalIgnoreCase)
+                || item.Key.EndsWith($"_{retryTool}", StringComparison.OrdinalIgnoreCase)
+                || item.Value.Tool.Id.EndsWith($"_{retryTool}", StringComparison.OrdinalIgnoreCase));
+            if (string.IsNullOrWhiteSpace(function.Key)) return false;
+
+            var arguments = new Dictionary<string, object?>();
+            if (structured.TryGetProperty("retry_arguments", out var retryArguments)
+                && retryArguments.ValueKind == JsonValueKind.Object)
+            {
+                arguments = JsonSerializer.Deserialize<Dictionary<string, object?>>(
+                    retryArguments.GetRawText(),
+                    ToolArgumentJsonOptions) ?? new Dictionary<string, object?>();
+            }
+            retryCall = new FunctionCallContent(
+                $"required-retry-{step}-{Guid.NewGuid():N}",
+                function.Key,
+                arguments);
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private async Task<ReasoningStrategySelection> SelectReasoningStrategyAsync(
+        GoldfishHarnessRequest request,
+        CancellationToken ct)
+        => await _reasoningStrategyDecider.SelectAsync(
+            new ReasoningStrategyDecisionRequest(
+                request.SessionId,
+                request.UserMessageText,
+                request.ReasoningOptions,
+                request.CachedReasoningSelection),
+            ct);
+
+    private async Task<ReasoningPlan?> CreatePlanIfNeededAsync(
+        GoldfishHarnessRequest request,
+        ReasoningStrategySelection selection,
+        IReadOnlyList<MsChatMessage> messages,
+        CancellationToken ct)
+    {
+        if (selection.Effective != ReasoningStrategyKind.PlanAndExecute)
+        {
+            return null;
+        }
+
+        var options = request.ReasoningOptions ?? ReasoningOptions.Default;
+        var planningMessages = messages.ToList();
+        planningMessages.Add(new MsChatMessage(ChatRole.User, BuildPlanCreationPrompt(request.UserMessageText, options.MaxPlanSteps)));
+        var response = await _chatClient.GetResponseAsync(
+            planningMessages,
+            BuildChatOptions(request, new Dictionary<string, ToolFunction>()),
+            ct);
+        return ReasoningPlanParser.ParseOrFallback(response.Text, request.UserMessageText, options.MaxPlanSteps);
+    }
+
+    private static string BuildPlanCreationPrompt(string userMessage, int maxPlanSteps)
+        => $$"""
+请为当前用户请求生成一个简洁执行计划。只输出 JSON，不要输出 Markdown。
+JSON 格式：
+{
+  "summary": "一句话概括计划",
+  "steps": [
+    { "title": "步骤标题", "description": "这一步要完成的可验证目标" }
+  ]
+}
+
+约束：
+- 最多 {{Math.Max(1, maxPlanSteps)}} 步。
+- 除非用户请求本身只能一步完成，否则至少拆成 2 步：先获取或处理必要信息，再汇总并形成最终结果。
+- 不要调用工具，不要编造工具结果。
+- 计划应服务于后续执行，而不是面向用户的最终回答。
+
+用户请求：
+{{userMessage}}
+""";
+
+    private static void AppendPlanToLeadingSystemMessage(IList<MsChatMessage> messages, ReasoningPlan plan)
+    {
+        if (messages.Count == 0 || messages[0].Role != ChatRole.System)
+        {
+            messages.Insert(0, new MsChatMessage(ChatRole.System, plan.ToPromptSection()));
+            return;
+        }
+
+        messages[0] = new MsChatMessage(ChatRole.System, $"{messages[0].Text?.TrimEnd()}\n\n{plan.ToPromptSection()}");
+    }
+
+    private async Task<ReasoningReWooGraph?> CreateReWooGraphIfNeededAsync(
+        GoldfishHarnessRequest request,
+        ReasoningStrategySelection selection,
+        IReadOnlyList<MsChatMessage> messages,
+        IReadOnlyDictionary<string, ToolFunction> toolFunctions,
+        CancellationToken ct)
+    {
+        if (selection.Effective != ReasoningStrategyKind.ReWOO || toolFunctions.Count == 0)
+        {
+            return null;
+        }
+
+        var options = request.ReasoningOptions ?? ReasoningOptions.Default;
+        var graphMessages = messages.ToList();
+        graphMessages.Add(new MsChatMessage(
+            ChatRole.User,
+            BuildReWooGraphPrompt(request.UserMessageText, toolFunctions, options.MaxReasoningSteps)));
+        var response = await _chatClient.GetResponseAsync(
+            graphMessages,
+            BuildChatOptions(request, new Dictionary<string, ToolFunction>()),
+            ct);
+        return ReasoningReWooGraphParser.ParseOrFallback(
+            response.Text,
+            toolFunctions.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase),
+            options.MaxReasoningSteps);
+    }
+
+    private static string BuildReWooGraphPrompt(
+        string userMessage,
+        IReadOnlyDictionary<string, ToolFunction> toolFunctions,
+        int maxNodes)
+    {
+        var tools = string.Join("\n", toolFunctions.Select(item =>
+            $"- {item.Key}: {item.Value.Description}"));
+        return $$"""
+请为当前用户请求生成 ReWOO 工具图。只输出 JSON，不要输出 Markdown。
+JSON 格式：
+{
+  "summary": "一句话概括工具图",
+  "nodes": [
+    { "id": "N1", "tool": "必须使用下方工具名", "purpose": "该节点要收集的证据", "arguments": {} }
+  ]
+}
+
+约束：
+- 最多 {{Math.Max(1, maxNodes)}} 个节点。
+- 只允许使用下方工具名，不要编造工具。
+- arguments 必须是 JSON object。
+- 不要输出最终答案，不要编造工具结果。
+
+可用工具：
+{{tools}}
+
+用户请求：
+{{userMessage}}
+""";
+    }
+
+    private static void AppendReWooGraphToLeadingSystemMessage(IList<MsChatMessage> messages, ReasoningReWooGraph graph)
+    {
+        if (messages.Count == 0 || messages[0].Role != ChatRole.System)
+        {
+            messages.Insert(0, new MsChatMessage(ChatRole.System, graph.ToPromptSection()));
+            return;
+        }
+
+        messages[0] = new MsChatMessage(ChatRole.System, $"{messages[0].Text?.TrimEnd()}\n\n{graph.ToPromptSection()}");
+    }
+
+    private async Task<IReadOnlyList<ToolCallRecord>> ExecuteReWooGraphAsync(
+        GoldfishHarnessRequest request,
+        string runId,
+        ReasoningReWooGraph graph,
+        IReadOnlyDictionary<string, ToolFunction> toolFunctions,
+        CancellationToken ct)
+    {
+        var records = new List<ToolCallRecord>();
+        foreach (var node in graph.Nodes)
+        {
+            if (!toolFunctions.TryGetValue(node.Tool, out var function))
+            {
+                records.Add(new ToolCallRecord
+                {
+                    ToolCallId = $"rewoo-{node.Id}",
+                    ToolId = node.Tool,
+                    Arguments = node.ArgumentsJson,
+                    Result = $"Tool not found: {node.Tool}",
+                    Success = false
+                });
+                continue;
+            }
+
+            var call = new FunctionCallContent(
+                $"rewoo-{graph.GraphId}-{node.Id}",
+                function.Name,
+                ParseFunctionArguments(node.ArgumentsJson));
+            records.Add(await ExecuteFunctionCallAsync(request, runId, 0, call, toolFunctions, ct));
+        }
+
+        return records;
+    }
+
+    private static Dictionary<string, object?> ParseFunctionArguments(string? argumentsJson)
+    {
+        if (string.IsNullOrWhiteSpace(argumentsJson))
+        {
+            return [];
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<Dictionary<string, object?>>(
+                argumentsJson,
+                ToolArgumentJsonOptions) ?? [];
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private static void AppendReWooObservations(
+        IList<MsChatMessage> messages,
+        IReadOnlyList<ToolCallRecord> records)
+    {
+        if (records.Count == 0)
+        {
+            return;
+        }
+
+        var observations = string.Join("\n\n", records.Select((record, index) =>
+            $"[{index + 1}] Tool: {record.ToolId}\nSuccess: {record.Success}\nArguments: {record.Arguments}\nResult:\n{BuildReadableToolResult(record)}"));
+        messages.Add(new MsChatMessage(ChatRole.User, $"""
+[ReWOO 工具图观察]
+Harness 已按 ReWOO 工具图执行以下节点。请基于这些真实观察继续综合，不要重复调用已经完成且成功的同一工具节点，除非需要补充证据。
+
+{observations}
+"""));
+    }
+
+    private async Task<ReasoningReflection?> ReflectFinalAnswerIfNeededAsync(
+        GoldfishHarnessRequest request,
+        ReasoningStrategySelection selection,
+        IReadOnlyList<MsChatMessage> messages,
+        string answer,
+        CancellationToken ct)
+    {
+        var options = request.ReasoningOptions ?? ReasoningOptions.Default;
+        if (!selection.ReflexionEnabled
+            || options.MaxReflectionRetries <= 0
+            || !ShouldRunReflexion(request.UserMessageText, answer))
+        {
+            return null;
+        }
+
+        var reflectionMessages = messages.ToList();
+        reflectionMessages.Add(new MsChatMessage(ChatRole.User, BuildReflectionPrompt(request.UserMessageText, answer)));
+        var response = await _chatClient.GetResponseAsync(
+            reflectionMessages,
+            BuildChatOptions(request, new Dictionary<string, ToolFunction>()),
+            ct);
+        return ReasoningReflectionParser.ParseOrKeep(response.Text, answer);
+    }
+
+    private static bool ShouldRunReflexion(string? userMessage, string? answer)
+    {
+        if (string.IsNullOrWhiteSpace(answer)) return true;
+        var text = userMessage ?? string.Empty;
+        return Regex.IsMatch(
+            text,
+            "(必须|不要|不得|不能|限制|约束|验收|失败|错误|修正|纠错|不超过|至少|恰好|只输出|JSON|格式)",
+            RegexOptions.CultureInvariant);
+    }
+
+    private static string BuildReflectionPrompt(string userMessage, string answer)
+        => $$"""
+你是 Goldfish Harness 的 Reflexion 校验器。请检查当前最终答案是否满足用户请求和系统约束。
+只输出 JSON，不要输出 Markdown。
+JSON 格式：
+{"action":"keep|revise","reason":"简短原因","answer":"当 action=revise 时输出修正后的最终答案"}
+
+约束：
+- 如果当前答案已经满足要求，输出 {"action":"keep","reason":"..."}。
+- 如果存在遗漏、格式错误、违反限制、空答复或明显未完成，输出 action=revise，并给出可以直接返回用户的修正版 answer。
+- 不要暴露内部推理过程。
+
+用户请求：
+{{userMessage}}
+
+当前最终答案：
+{{answer}}
+""";
+
+    private static ReasoningPlanStep? GetPlanStep(ReasoningPlan? plan, int oneBasedStep)
+    {
+        if (plan is null || plan.Steps.Count == 0 || oneBasedStep < 1 || oneBasedStep > plan.Steps.Count)
+        {
+            return null;
+        }
+
+        return plan.Steps[oneBasedStep - 1];
+    }
+
+    private static IEnumerable<GoldfishHarnessEvent> CompleteRemainingPlanSteps(
+        ReasoningPlan plan,
+        int completedThroughIndex)
+    {
+        foreach (var step in plan.Steps.Where(item => item.Index > completedThroughIndex))
+        {
+            yield return GoldfishHarnessEvent.PlanStepStarted(step);
+            yield return GoldfishHarnessEvent.PlanStepCompleted(step, "已由最终回答覆盖完成。");
+        }
     }
 
     private static ChatOptions BuildChatOptions(GoldfishHarnessRequest request, IReadOnlyDictionary<string, ToolFunction> toolFunctions)
@@ -333,10 +963,17 @@ public sealed class GoldfishHarnessRunner
         => BuildMessages(request, null);
 
     private List<MsChatMessage> BuildMessages(GoldfishHarnessRequest request, SkillRuntimeState? skillState)
+        => BuildMessages(request, skillState, ReasoningStrategySelector.Select(request.UserMessageText, request.ReasoningOptions));
+
+    private List<MsChatMessage> BuildMessages(
+        GoldfishHarnessRequest request,
+        SkillRuntimeState? skillState,
+        ReasoningStrategySelection reasoningSelection)
     {
         var context = GoldfishRunContext.FromAgentInfo(request.AgentInfo, request.SessionId, request.DisableConfigCache);
         var memoryOptions = request.MemoryOptions ?? MemoryOptions.Default;
         var systemPrompt = BuildSystemPrompt(context, memoryOptions, request.SkillOptions ?? SkillOptions.Default);
+        systemPrompt = $"{systemPrompt.TrimEnd()}\n\n{reasoningSelection.ToPromptSection()}";
         var suppliedMemory = request.MemoryContext;
         if (suppliedMemory is not null)
         {
@@ -367,7 +1004,18 @@ public sealed class GoldfishHarnessRunner
             historyForPrompt = historyForPrompt.Take(historyForPrompt.Count - 1).ToList();
         }
 
-        foreach (var msg in SelectShortTermHistory(historyForPrompt, memoryOptions.ShortTerm, _maxHistoryMessages))
+        var selectedHistory = SelectShortTermHistory(
+                historyForPrompt,
+                memoryOptions.ShortTerm,
+                _maxHistoryMessages)
+            .ToList();
+        selectedHistory = ApplyEstimatedPromptBudget(
+            selectedHistory,
+            systemPrompt,
+            request.UserMessageText,
+            memoryOptions.MediumTerm);
+
+        foreach (var msg in selectedHistory)
         {
             messages.Add(new MsChatMessage(ParseRole(msg.Role), msg.Content));
         }
@@ -434,7 +1082,7 @@ public sealed class GoldfishHarnessRunner
         {
             sb.AppendLine($"- 项目目录: {context.Agent.ProjectDirectory}");
         }
-        // 网关路由信息已由 GatewayServer 注入 Instructions（context.Agent.SystemPrompt 内），此处不再重复渲染。
+        // Host/channel routing instructions belong in Agent.SystemPrompt; do not duplicate them here.
         sb.AppendLine();
         sb.AppendLine("## 对话历史");
         if (memoryOptions.ShortTerm.Enabled)
@@ -616,6 +1264,31 @@ public sealed class GoldfishHarnessRunner
             .OrderBy(m => m.CreatedAt)
             .TakeLast(maxMessages)
             .ToList();
+    }
+
+    private static List<ChatMessage> ApplyEstimatedPromptBudget(
+        List<ChatMessage> history,
+        string systemPrompt,
+        string userMessage,
+        MediumTermMemoryOptions options)
+    {
+        var budget = ContextTokenEstimator.EffectiveInputBudget(options);
+        if (budget <= 0 || history.Count == 0)
+        {
+            return history;
+        }
+
+        var fixedTokens = ContextTokenEstimator.EstimateTextTokens(systemPrompt, options.EstimatedCharsPerToken)
+            + ContextTokenEstimator.EstimateTextTokens(userMessage, options.EstimatedCharsPerToken)
+            + 8;
+        var result = history.ToList();
+        while (result.Count > 0
+            && fixedTokens + ContextTokenEstimator.EstimateMessageTokens(result, options.EstimatedCharsPerToken) > budget)
+        {
+            result.RemoveAt(0);
+        }
+
+        return result;
     }
 
     private static string BuildMemoryPrompt(MemoryContext memoryContext)
@@ -1370,7 +2043,9 @@ public sealed record GoldfishHarnessRequest(
     SkillOptions? SkillOptions = null,
     ISkillSessionStore? SkillSessionStore = null,
     IToolExecutionStore? ToolExecutionStore = null,
-    IToolAuthorizationHook? ToolAuthorizationHook = null);
+    IToolAuthorizationHook? ToolAuthorizationHook = null,
+    ReasoningOptions? ReasoningOptions = null,
+    ReasoningStrategySelection? CachedReasoningSelection = null);
 
 public interface IGoldfishSteerSource
 {
@@ -1384,7 +2059,7 @@ public sealed record GoldfishHarnessRunResult
     public List<ToolCallRecord> ToolCalls { get; } = new();
 }
 
-/// <summary>Harness 内部标准事件类型。AgentNode 据此映射为 Responses/AG-UI/网关事件。</summary>
+/// <summary>Harness standard event types. Hosts map these to their transport-specific events.</summary>
 public enum GoldfishEventKind
 {
     RunStarted,
@@ -1392,6 +2067,14 @@ public enum GoldfishEventKind
     TextDelta,
     ToolCallStarted,
     ToolResult,
+    ReasoningStrategySelected,
+    PlanCreated,
+    PlanStepStarted,
+    PlanStepCompleted,
+    PlanStepFailed,
+    ReflectionCompleted,
+    ReWooGraphCreated,
+    ReasoningTraceCompleted,
     Completed,
     Failed,
 }
@@ -1412,6 +2095,7 @@ public sealed record GoldfishHarnessEvent
     public string? Result { get; init; }
     public bool? Success { get; init; }
     public IReadOnlyList<object>? Attachments { get; init; }
+    public ReasoningStrategySelection? ReasoningSelection { get; init; }
 
     public static GoldfishHarnessEvent RunStarted(string runId) => new()
     {
@@ -1457,7 +2141,7 @@ public sealed record GoldfishHarnessEvent
         ToolCallId = string.IsNullOrWhiteSpace(record.ToolCallId) ? $"{step}:{record.ToolId}" : record.ToolCallId,
         Arguments = record.Arguments,
         Result = string.IsNullOrWhiteSpace(record.DisplayText) ? record.Result : record.DisplayText!,
-        Delta = $"调用工具 {record.ToolId}",
+        Delta = BuildToolCallDelta(record.ToolId, record.Arguments),
         Success = record.Success,
         Attachments = record.Attachments
     };
@@ -1469,7 +2153,7 @@ public sealed record GoldfishHarnessEvent
         ToolId = toolId,
         ToolCallId = string.IsNullOrWhiteSpace(toolCallId) ? $"{step}:{toolId}" : toolCallId,
         Arguments = arguments,
-        Delta = $"调用工具 {toolId}",
+        Delta = BuildToolCallDelta(toolId, arguments),
         Success = null
     };
 
@@ -1486,6 +2170,163 @@ public sealed record GoldfishHarnessEvent
         Attachments = record.Attachments
     };
 
+    public static GoldfishHarnessEvent ReasoningStrategySelected(ReasoningStrategySelection selection) => new()
+    {
+        Kind = GoldfishEventKind.ReasoningStrategySelected,
+        Step = 0,
+        Delta = $"已选择推理策略：{selection.Effective}（{selection.Requested} / {selection.Reason} / Reflexion={(selection.ReflexionEnabled ? "开启" : "关闭")}）",
+        Result = selection.Effective.ToString(),
+        Success = true,
+        ReasoningSelection = selection
+    };
+
+    public static GoldfishHarnessEvent PlanCreated(ReasoningPlan plan) => new()
+    {
+        Kind = GoldfishEventKind.PlanCreated,
+        Step = 0,
+        Delta = BuildPlanCreatedDelta(plan),
+        Result = JsonSerializer.Serialize(new
+        {
+            plan.PlanId,
+            plan.Summary,
+            Steps = plan.Steps.Select(step => new
+            {
+                step.Index,
+                step.Title,
+                step.Description
+            })
+        }),
+        Success = true
+    };
+
+    private static string BuildPlanCreatedDelta(ReasoningPlan plan)
+    {
+        var sb = new StringBuilder();
+        sb.Append("已创建执行计划：");
+        sb.AppendLine(plan.Summary);
+        foreach (var step in plan.Steps)
+        {
+            sb.Append(step.Index);
+            sb.Append(". ");
+            sb.Append(step.Title);
+            if (!string.IsNullOrWhiteSpace(step.Description)
+                && !string.Equals(step.Description, step.Title, StringComparison.Ordinal))
+            {
+                sb.Append(" - ");
+                sb.Append(step.Description);
+            }
+
+            sb.AppendLine();
+        }
+
+        return sb.ToString().TrimEnd();
+    }
+
+    public static GoldfishHarnessEvent PlanStepStarted(ReasoningPlanStep step) => new()
+    {
+        Kind = GoldfishEventKind.PlanStepStarted,
+        Step = step.Index,
+        Delta = $"开始计划步骤 {step.Index}: {step.Title}",
+        Result = step.Description,
+        Success = null
+    };
+
+    public static GoldfishHarnessEvent PlanStepCompleted(ReasoningPlanStep step, string result) => new()
+    {
+        Kind = GoldfishEventKind.PlanStepCompleted,
+        Step = step.Index,
+        Delta = $"完成计划步骤 {step.Index}: {step.Title}",
+        Result = result,
+        Success = true
+    };
+
+    public static GoldfishHarnessEvent PlanStepFailed(ReasoningPlanStep step, string error) => new()
+    {
+        Kind = GoldfishEventKind.PlanStepFailed,
+        Step = step.Index,
+        Delta = $"计划步骤 {step.Index} 未完成: {step.Title}",
+        Result = error,
+        Success = false
+    };
+
+    public static GoldfishHarnessEvent ReWooGraphCreated(ReasoningReWooGraph graph) => new()
+    {
+        Kind = GoldfishEventKind.ReWooGraphCreated,
+        Step = 0,
+        Delta = BuildReWooGraphCreatedDelta(graph),
+        Result = JsonSerializer.Serialize(new
+        {
+            graph.GraphId,
+            graph.Summary,
+            Nodes = graph.Nodes.Select(node => new
+            {
+                node.Id,
+                node.Tool,
+                node.Purpose,
+                node.ArgumentsJson
+            })
+        }),
+        Success = true
+    };
+
+    public static GoldfishHarnessEvent ReflectionCompleted(ReasoningReflection reflection) => new()
+    {
+        Kind = GoldfishEventKind.ReflectionCompleted,
+        Step = 0,
+        Delta = reflection.Revised
+            ? $"Reflexion 已修正最终答案：{reflection.Reason}"
+            : $"Reflexion 已完成校验：{reflection.Reason}",
+        Result = reflection.Answer,
+        Success = true
+    };
+
+    public static GoldfishHarnessEvent ReasoningTraceCompleted(IReadOnlyList<GoldfishHarnessEvent> events) => new()
+    {
+        Kind = GoldfishEventKind.ReasoningTraceCompleted,
+        Step = 0,
+        Delta = BuildReasoningTraceDelta(events),
+        Success = true
+    };
+
+    private static string BuildToolCallDelta(string toolId, string arguments)
+    {
+        if (string.IsNullOrWhiteSpace(arguments) || arguments.Trim() == "{}")
+        {
+            return $"调用工具 {toolId}";
+        }
+
+        return $"调用工具 {toolId}\n参数: {TruncateForProcess(arguments.Trim(), 500)}";
+    }
+
+    private static string BuildReWooGraphCreatedDelta(ReasoningReWooGraph graph)
+    {
+        var sb = new StringBuilder();
+        sb.Append("已创建 ReWOO 工具图：");
+        sb.AppendLine(graph.Summary);
+        foreach (var node in graph.Nodes)
+        {
+            sb.Append(node.Id);
+            sb.Append(". ");
+            sb.Append(node.Tool);
+            if (!string.IsNullOrWhiteSpace(node.Purpose))
+            {
+                sb.Append(" - ");
+                sb.Append(node.Purpose);
+            }
+
+            if (!string.IsNullOrWhiteSpace(node.ArgumentsJson) && node.ArgumentsJson.Trim() != "{}")
+            {
+                sb.AppendLine();
+                sb.Append("   参数: ");
+                sb.Append(TruncateForProcess(node.ArgumentsJson.Trim(), 500));
+            }
+
+            sb.AppendLine();
+        }
+
+        return sb.ToString().TrimEnd();
+    }
+
     private static string BuildToolResultDelta(string toolId, string result)
     {
         if (string.IsNullOrWhiteSpace(toolId)) return result;
@@ -1495,5 +2336,108 @@ public sealed record GoldfishHarnessEvent
             return result;
         }
         return $"工具 {toolId} 结果:\n{result}";
+    }
+
+    private static string BuildReasoningTraceDelta(IReadOnlyList<GoldfishHarnessEvent> events)
+    {
+        var items = new List<string>();
+        foreach (var ev in events)
+        {
+            if (!TryFormatReasoningTraceItem(ev, out var item))
+            {
+                continue;
+            }
+
+            if (items.Count > 0 && string.Equals(items[^1], item, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            items.Add(item);
+        }
+
+        if (items.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var sb = new StringBuilder();
+        sb.AppendLine("【推理策略执行过程】");
+        for (var i = 0; i < items.Count; i++)
+        {
+            sb.Append(i + 1);
+            sb.Append(". ");
+            sb.AppendLine(items[i]);
+        }
+
+        return sb.ToString().TrimEnd();
+    }
+
+    private static bool TryFormatReasoningTraceItem(GoldfishHarnessEvent ev, out string item)
+    {
+        item = string.Empty;
+        switch (ev.Kind)
+        {
+            case GoldfishEventKind.ReasoningStrategySelected:
+                if (ev.ReasoningSelection is { } selection)
+                {
+                    item = $"策略选择：Requested={selection.Requested}，Effective={selection.Effective}，Reason={selection.Reason}，Reflexion={(selection.ReflexionEnabled ? "开启" : "关闭")}";
+                }
+                else
+                {
+                    item = $"策略选择：{Fallback(ev.Result, ev.Delta, "未知")}";
+                }
+                return true;
+            case GoldfishEventKind.PlanCreated:
+                item = "创建执行计划：" + CompactMultiline(Fallback(ev.Delta, ev.Result, "已创建执行计划。"));
+                return true;
+            case GoldfishEventKind.PlanStepStarted:
+                item = CompactMultiline(Fallback(ev.Delta, null, $"开始计划步骤 {ev.Step}。"));
+                return true;
+            case GoldfishEventKind.PlanStepCompleted:
+                item = CompactMultiline(Fallback(ev.Delta, ev.Result, $"完成计划步骤 {ev.Step}。"));
+                return true;
+            case GoldfishEventKind.PlanStepFailed:
+                item = CompactMultiline(Fallback(ev.Delta, ev.Result, $"计划步骤 {ev.Step} 未完成。"));
+                return true;
+            case GoldfishEventKind.ReWooGraphCreated:
+                item = "创建 ReWOO 工具图：" + CompactMultiline(Fallback(ev.Delta, ev.Result, "已创建 ReWOO 工具图。"));
+                return true;
+            case GoldfishEventKind.ToolCallStarted:
+                item = string.IsNullOrWhiteSpace(ev.ToolId)
+                    ? "调用工具。"
+                    : $"调用工具：{ev.ToolId}" + (string.IsNullOrWhiteSpace(ev.Arguments) || ev.Arguments.Trim() == "{}"
+                        ? string.Empty
+                        : $"，参数={TruncateForProcess(ev.Arguments.Trim(), 300)}");
+                return true;
+            case GoldfishEventKind.ToolResult:
+                item = $"工具返回：{Fallback(ev.ToolId, null, "tool")}，状态={(ev.Success == false ? "失败" : "成功")}";
+                if (!string.IsNullOrWhiteSpace(ev.Result))
+                {
+                    item += $"，摘要={TruncateForProcess(CompactMultiline(ev.Result), 300)}";
+                }
+                return true;
+            case GoldfishEventKind.ReflectionCompleted:
+                item = CompactMultiline(Fallback(ev.Delta, null, "Reflexion 已完成校验。"));
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static string CompactMultiline(string value)
+        => Regex.Replace(value.Trim(), @"\s+", " ");
+
+    private static string Fallback(string? value, string? second, string fallback)
+        => !string.IsNullOrWhiteSpace(value)
+            ? value.Trim()
+            : !string.IsNullOrWhiteSpace(second)
+                ? second.Trim()
+                : fallback;
+
+    private static string TruncateForProcess(string value, int maxChars)
+    {
+        if (value.Length <= maxChars) return value;
+        return value[..maxChars] + "...";
     }
 }

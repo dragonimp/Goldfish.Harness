@@ -9,6 +9,10 @@
       "MediumTerm": {
         "Enabled": true,
         "CompressionThresholdMessages": 24,
+        "CompressionThresholdEstimatedTokens": 12000,
+        "MaxEstimatedInputTokens": 16000,
+        "OutputTokenReserve": 2048,
+        "EstimatedCharsPerToken": 4.0,
         "RetainRecentMessages": 8,
         "MaxSummaries": 3,
         "MaxSummaryChars": 2000

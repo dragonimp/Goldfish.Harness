@@ -86,7 +86,7 @@ public class ToolCallRecord
     /// <summary>工具自带的可读展示文本（envelope.displayText）。为空时由 Result 反向格式化。</summary>
     public string? DisplayText { get; set; }
 
-    /// <summary>工具返回的附件对象，由 AgentNode 转换为网关附件事件。</summary>
+    /// <summary>工具返回的附件对象，由宿主转换为对应的附件事件。</summary>
     public IReadOnlyList<object>? Attachments { get; set; }
 }
 

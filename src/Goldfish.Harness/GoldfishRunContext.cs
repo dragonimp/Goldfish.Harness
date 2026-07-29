@@ -11,13 +11,6 @@ public sealed record GoldfishRunContext
     public GoldfishUserContext User { get; init; } = new();
     public GoldfishAgentContext Agent { get; init; } = new();
 
-    /// <summary>
-    /// 网关来源信息。仅当请求确实来自网关通道时非空。
-    /// 注意：网关路由说明已由 GatewayServer 注入系统提示词（Instructions），
-    /// 此处保留结构化字段供 trace / 工具 / 后续逻辑使用，不再二次渲染进 prompt。
-    /// </summary>
-    public GoldfishGatewayContext? Gateway { get; init; }
-
     public static GoldfishRunContext FromAgentInfo(AgentInfo agentInfo, string sessionId, bool disableConfigCache = true)
     {
         var extra = agentInfo.ExtraData;
@@ -32,19 +25,6 @@ public sealed record GoldfishRunContext
             }
             return null;
         }
-
-        var gateway = extra.Keys.Any(k => k.StartsWith("Gateway", StringComparison.OrdinalIgnoreCase))
-            ? new GoldfishGatewayContext
-            {
-                ChannelId = Get("GatewayChannelId"),
-                ChannelName = Get("GatewayChannelName"),
-                Type = Get("GatewayType"),
-                BotId = Get("GatewayBotId"),
-                AppId = Get("GatewayAppId"),
-                Sender = Get("GatewaySender"),
-                ConversationId = Get("GatewayConversationId")
-            }
-            : null;
 
         return new GoldfishRunContext
         {
@@ -63,8 +43,7 @@ public sealed record GoldfishRunContext
                 Type = agentInfo.AgentType,
                 SystemPrompt = agentInfo.SystemPrompt ?? string.Empty,
                 ProjectDirectory = First("ProjectDirectory", "ProjectPath", "ModelAgent")
-            },
-            Gateway = gateway
+            }
         };
     }
 }
@@ -83,15 +62,4 @@ public sealed record GoldfishAgentContext
     public string? Type { get; init; }
     public string? ProjectDirectory { get; init; }
     public string SystemPrompt { get; init; } = string.Empty;
-}
-
-public sealed record GoldfishGatewayContext
-{
-    public string? ChannelId { get; init; }
-    public string? ChannelName { get; init; }
-    public string? Type { get; init; }
-    public string? BotId { get; init; }
-    public string? AppId { get; init; }
-    public string? Sender { get; init; }
-    public string? ConversationId { get; init; }
 }

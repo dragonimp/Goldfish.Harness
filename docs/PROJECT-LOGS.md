@@ -13,3 +13,14 @@
 - Added SQLite harness state storage for session skills and tool execution audit hashes.
 - Enforced a single leading system message across Runner and legacy PromptBuilder paths.
 - Verified all 24 automated tests pass.
+
+## 2026-07-22
+
+- Added estimated-token context compression triggers for in-memory and SQLite memory managers.
+- Added runner-side prompt budget trimming for callers that pass raw history without prebuilt memory context.
+- Updated project metadata to version `0.1.2`.
+- Verified all 27 automated tests pass.
+- Added reasoning strategy design document for ReAct, Plan-and-Execute, ReWOO, and Reflexion.
+- Started T24 P0 implementation with `ReasoningOptions`, strategy selection, leading-system prompt injection, and `ReasoningStrategySelected` events.
+- Added reasoning strategy unit tests and saved the test report in `docs/REASONING-STRATEGY-TEST-REPORT.md`.
+- Verified all 31 automated tests pass.
