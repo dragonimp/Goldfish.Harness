@@ -12,5 +12,6 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/Goldfish.Harness/Goldfish.Harness.csproj" />
+    <ProjectReference Include="../../src/Goldfish.Harness.AcpHost/Goldfish.Harness.AcpHost.csproj" />
   </ItemGroup>
 </Project>

@@ -1,6 +1,8 @@
 # Goldfish Harness
 
-Goldfish Harness is the standalone C# reasoning library used by Goldfish AgentNode.
+Goldfish Harness is a standalone C# reasoning runtime. It can be embedded as a
+library or launched as an independent ACP process; it does not depend on
+Goldfish AgentNode.
 
 It contains the model-driven ReAct loop, native tool/function calling integration,
 streaming harness events, prompt/context abstractions, and tool registry contracts.
@@ -14,6 +16,7 @@ dotnet build Goldfish.Harness.slnx -c Release
 ## Project Layout
 
 - `src/Goldfish.Harness`: class library targeting `.NET 10`
+- `src/Goldfish.Harness.AcpHost`: independent stdio ACP host targeting `.NET 10`
 - `GoldfishHarnessRunner`: main entry point for non-streaming and streaming runs
 - `IToolRegistry` / `ITool`: tool loading and invocation contracts
 - `GoldfishHarnessEvent`: strongly typed stream event model
@@ -23,6 +26,60 @@ AgentFree references this project as a sibling checkout:
 ```xml
 <ProjectReference Include="../../../Goldfish.Harness/src/Goldfish.Harness/Goldfish.Harness.csproj" />
 ```
+
+## ACP host
+
+Build or publish the independent host without AgentNode:
+
+```bash
+dotnet build src/Goldfish.Harness.AcpHost/Goldfish.Harness.AcpHost.csproj -c Release
+dotnet publish src/Goldfish.Harness.AcpHost/Goldfish.Harness.AcpHost.csproj -c Release -o artifacts/acp-host
+```
+
+The host exchanges one JSON-RPC frame per line over standard input and output.
+Diagnostics go to standard error so they cannot corrupt the ACP stream. It
+supports `initialize`, `session/new`, `session/prompt`, `session/cancel`, and
+`shutdown`. Harness text, reasoning, tool lifecycle, attachment, and runtime
+error events are projected to ACP `session/update` notifications.
+
+`session/new` requires an absolute `cwd` and runtime configuration under
+`_meta.agentfree.runtime`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "session/new",
+  "params": {
+    "cwd": "/absolute/workspace",
+    "_meta": {
+      "agentfree": {
+        "requestedSessionId": "session-1",
+        "runtime": {
+          "baseUrl": "https://llm.example/v1",
+          "apiKey": "resolved-by-the-host-launcher",
+          "model": "model-id",
+          "systemPrompt": "You are a coding agent.",
+          "stateRoot": "/absolute/state-directory",
+          "maxOutputTokens": 4096,
+          "memory": {
+            "tenantId": "tenant",
+            "userId": "user",
+            "agentId": "agent",
+            "workspaceId": "workspace"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+The ACP launcher owns secret resolution and process isolation. Avoid persisting
+API keys in project files or session history. `cwd`, `stateRoot`, and
+`skillsRoot` must be absolute paths. Built-in file tools are restricted to
+`cwd`; command execution intentionally runs inside that workspace and should be
+guarded by the launcher's sandbox and approval policy.
 
 ## Vector memory
 
