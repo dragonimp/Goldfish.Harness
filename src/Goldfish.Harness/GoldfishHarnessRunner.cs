@@ -626,7 +626,9 @@ public sealed class GoldfishHarnessRunner
         {
             using var document = JsonDocument.Parse(record.Result);
             var root = document.RootElement;
-            if (!root.TryGetProperty("structuredContent", out var structured)
+            if (root.ValueKind != JsonValueKind.Object
+                || !root.TryGetProperty("structuredContent", out var structured)
+                || structured.ValueKind != JsonValueKind.Object
                 || !structured.TryGetProperty("requires_child_list_retry", out var required)
                 || required.ValueKind != JsonValueKind.True
                 || !structured.TryGetProperty("retry_tool", out var retryToolElement))

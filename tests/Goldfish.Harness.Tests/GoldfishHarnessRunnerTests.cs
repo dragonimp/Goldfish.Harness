@@ -831,6 +831,31 @@ public sealed class GoldfishHarnessRunnerTests
     }
 
     [Fact]
+    public void RequiredRetryDetection_IgnoresArrayToolResults()
+    {
+        var toolFunctionType = typeof(GoldfishHarnessRunner).GetNestedType(
+            "ToolFunction",
+            BindingFlags.NonPublic)!;
+        var dictionaryType = typeof(Dictionary<,>).MakeGenericType(typeof(string), toolFunctionType);
+        var toolFunctions = Activator.CreateInstance(dictionaryType)!;
+        var method = typeof(GoldfishHarnessRunner).GetMethod(
+            "TryCreateRequiredRetryCall",
+            BindingFlags.Static | BindingFlags.NonPublic)!;
+        object?[] arguments =
+        [
+            new ToolCallRecord { Result = """[{"name":"mcp"}]""", Success = true },
+            toolFunctions,
+            1,
+            null
+        ];
+
+        var created = Assert.IsType<bool>(method.Invoke(null, arguments));
+
+        Assert.False(created);
+        Assert.Null(arguments[3]);
+    }
+
+    [Fact]
     public async Task SqliteHarnessStateStore_PersistsSkillsAndToolAuditHashes()
     {
         var databasePath = Path.Combine(
