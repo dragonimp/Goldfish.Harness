@@ -11,7 +11,7 @@ public static class AcpHostAssembly;
 internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter error)
 {
     private readonly ConcurrentDictionary<string, HostSession> _sessions = new(StringComparer.Ordinal);
-    private readonly ConcurrentDictionary<string, CancellationTokenSource> _activeRuns = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, ActiveRun> _activeRuns = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private readonly GoldfishAcpEventProjector _projector = new();
 
@@ -103,36 +103,48 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
             ?? throw new InvalidOperationException("session/prompt requires sessionId.");
         if (!_sessions.TryGetValue(sessionId, out var session))
             throw new InvalidOperationException($"ACP session not found: {sessionId}");
-        if (!_activeRuns.TryAdd(sessionId, new CancellationTokenSource()))
+        var run = new ActiveRun();
+        if (!_activeRuns.TryAdd(sessionId, run))
+        {
+            run.Dispose();
             throw new InvalidOperationException($"ACP session already has an active run: {sessionId}");
+        }
 
-        var cts = _activeRuns[sessionId];
         var prompt = ReadPrompt(parameters);
         _ = Task.Run(async () =>
         {
+            Exception? failure = null;
+            var stopReason = "end_turn";
             try
             {
-                await ExecutePromptAsync(id, session, prompt, cts.Token);
+                await ExecutePromptAsync(session, prompt, run.Token);
             }
             catch (OperationCanceledException)
             {
-                await WriteAsync(GoldfishAcpProtocol.PromptResult(id, "cancelled"));
+                stopReason = "cancelled";
             }
             catch (Exception ex)
             {
-                await error.WriteLineAsync(ex.ToString());
-                await WriteAsync(GoldfishAcpProtocol.RuntimeError(session.SessionId, ex.Message, ex.GetType().Name));
-                await WriteAsync(GoldfishAcpProtocol.PromptResult(id, "refusal"));
+                failure = ex;
+                stopReason = "refusal";
             }
             finally
             {
                 _activeRuns.TryRemove(sessionId, out _);
-                cts.Dispose();
+                run.Completion.TrySetResult();
+                run.Dispose();
             }
+
+            if (failure is not null)
+            {
+                await error.WriteLineAsync(failure.ToString());
+                await WriteAsync(GoldfishAcpProtocol.RuntimeError(session.SessionId, failure.Message, failure.GetType().Name));
+            }
+            await WriteAsync(GoldfishAcpProtocol.PromptResult(id, stopReason));
         });
     }
 
-    private async Task ExecutePromptAsync(JsonElement? id, HostSession session, string prompt, CancellationToken ct)
+    private async Task ExecutePromptAsync(HostSession session, string prompt, CancellationToken ct)
     {
         var runtime = session.Runtime;
         using var chatClient = new WhitespacePreservingOpenAiChatClient(
@@ -181,7 +193,6 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
 
         if (answer.Length > 0)
             await executor.PersistTurnAsync(request, answer.ToString(), ct);
-        await WriteAsync(GoldfishAcpProtocol.PromptResult(id));
     }
 
     private async Task CancelSessionAsync(JsonElement? id, JsonElement request)
@@ -189,9 +200,41 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
         var parameters = RequiredObject(request, "params");
         var sessionId = ReadString(parameters, "sessionId")
             ?? throw new InvalidOperationException("session/cancel requires sessionId.");
-        var cancelled = _activeRuns.TryGetValue(sessionId, out var cts);
-        cts?.Cancel();
+        var cancelled = _activeRuns.TryGetValue(sessionId, out var run);
+        if (run is not null)
+        {
+            run.Cancel();
+            await run.Completion.Task;
+        }
         await WriteAsync(GoldfishAcpProtocol.Response(id, new { cancelled }));
+    }
+
+    private sealed class ActiveRun : IDisposable
+    {
+        private readonly object _gate = new();
+        private readonly CancellationTokenSource _cancellation = new();
+        private bool _disposed;
+
+        public CancellationToken Token => _cancellation.Token;
+        public TaskCompletionSource Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public void Cancel()
+        {
+            lock (_gate)
+            {
+                if (!_disposed) _cancellation.Cancel();
+            }
+        }
+
+        public void Dispose()
+        {
+            lock (_gate)
+            {
+                if (_disposed) return;
+                _disposed = true;
+                _cancellation.Dispose();
+            }
+        }
     }
 
     private async Task WriteAsync(object frame)

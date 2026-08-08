@@ -181,6 +181,81 @@ public sealed class AcpHostProcessTests
         }
     }
 
+    [Fact]
+    public async Task IndependentProcess_CancelResponseIsBarrierForNextPrompt()
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(20));
+        await using var server = FakeOpenAiServer.Start("completed after cancellation", TimeSpan.FromSeconds(2));
+        var workspace = Directory.CreateTempSubdirectory("goldfish-acp-cancel-barrier-workspace-");
+        var state = Directory.CreateTempSubdirectory("goldfish-acp-cancel-barrier-state-");
+
+        try
+        {
+            using var process = StartHost();
+            await SendAsync(process, new
+            {
+                jsonrpc = "2.0",
+                id = 1,
+                method = "session/new",
+                @params = new
+                {
+                    cwd = workspace.FullName,
+                    _meta = new
+                    {
+                        agentfree = new
+                        {
+                            requestedSessionId = "cancel-barrier-session",
+                            runtime = new { baseUrl = server.BaseUrl, model = "test-model", stateRoot = state.FullName }
+                        }
+                    }
+                }
+            });
+            await ReadUntilResponseAsync(process, 1, timeout.Token);
+
+            await SendAsync(process, new
+            {
+                jsonrpc = "2.0",
+                id = 2,
+                method = "session/prompt",
+                @params = new { sessionId = "cancel-barrier-session", prompt = "wait" }
+            });
+            while (server.RequestCount == 0)
+                await Task.Delay(10, timeout.Token);
+
+            await SendAsync(process, new
+            {
+                jsonrpc = "2.0",
+                id = 3,
+                method = "session/cancel",
+                @params = new { sessionId = "cancel-barrier-session" }
+            });
+            var cancel = await ReadUntilResponseAsync(process, 3, timeout.Token);
+            Assert.True(cancel.GetProperty("result").GetProperty("cancelled").GetBoolean());
+
+            await SendAsync(process, new
+            {
+                jsonrpc = "2.0",
+                id = 4,
+                method = "session/prompt",
+                @params = new { sessionId = "cancel-barrier-session", prompt = "continue" }
+            });
+            var nextPrompt = await ReadUntilResponseAsync(process, 4, timeout.Token);
+            Assert.False(nextPrompt.TryGetProperty("error", out _));
+            Assert.Equal("end_turn", nextPrompt.GetProperty("result").GetProperty("stopReason").GetString());
+
+            await SendAsync(process, new { jsonrpc = "2.0", id = 5, method = "shutdown", @params = new { } });
+            await ReadUntilResponseAsync(process, 5, timeout.Token);
+            await process.WaitForExitAsync(timeout.Token);
+            Assert.Equal(0, process.ExitCode);
+        }
+        finally
+        {
+            workspace.Delete(recursive: true);
+            state.Delete(recursive: true);
+        }
+    }
+
     private static Process StartHost()
     {
         var assembly = typeof(AcpHostAssembly).Assembly.Location;
