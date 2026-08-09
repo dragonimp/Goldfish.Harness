@@ -96,10 +96,16 @@ public sealed class WhitespacePreservingOpenAiChatClient : IChatClient, IDisposa
             contents.Add(new FunctionCallContent(call.Id, call.Name, ParseArguments(call.Arguments)));
         }
 
-        return new ChatResponse(new Microsoft.Extensions.AI.ChatMessage(ChatRole.Assistant, contents))
+        var result = new ChatResponse(new Microsoft.Extensions.AI.ChatMessage(ChatRole.Assistant, contents))
         {
             ModelId = _model
         };
+        if (TryReadUsageDetails(doc.RootElement, out var usage))
+        {
+            result.Usage = usage;
+        }
+
+        return result;
     }
 
     public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
@@ -218,6 +224,7 @@ public sealed class WhitespacePreservingOpenAiChatClient : IChatClient, IDisposa
         {
             ["model"] = _model,
             ["stream"] = stream,
+            ["stream_options"] = stream ? new { include_usage = true } : null,
             ["messages"] = messages.Select(ToOpenAiMessage).ToList(),
             ["temperature"] = options?.Temperature,
             ["max_tokens"] = options?.MaxOutputTokens ?? _defaultMaxOutputTokens,
@@ -298,6 +305,17 @@ public sealed class WhitespacePreservingOpenAiChatClient : IChatClient, IDisposa
 
         using var doc = JsonDocument.Parse(data);
         var root = doc.RootElement;
+        if (TryReadUsageDetails(root, out var usage))
+        {
+            yield return new ChatResponseUpdate(
+                ChatRole.Assistant,
+                new List<AIContent> { new UsageContent(usage) { RawRepresentation = root.Clone() } })
+            {
+                ModelId = _model,
+                RawRepresentation = root.Clone()
+            };
+        }
+
         if (!root.TryGetProperty("choices", out var choices) || choices.ValueKind != JsonValueKind.Array || choices.GetArrayLength() == 0) yield break;
         var choice = choices[0];
         if (!choice.TryGetProperty("delta", out var delta) || delta.ValueKind != JsonValueKind.Object) yield break;
@@ -374,6 +392,66 @@ public sealed class WhitespacePreservingOpenAiChatClient : IChatClient, IDisposa
     {
         if (element.ValueKind != JsonValueKind.Object || !element.TryGetProperty(name, out var value)) return null;
         return value.ValueKind == JsonValueKind.String ? value.GetString() : value.ToString();
+    }
+
+    private static bool TryReadUsageDetails(JsonElement root, out UsageDetails usage)
+    {
+        usage = new UsageDetails();
+        var source = root.TryGetProperty("usage", out var usageElement) && usageElement.ValueKind == JsonValueKind.Object
+            ? usageElement
+            : root;
+        if (source.ValueKind != JsonValueKind.Object) return false;
+
+        var input = ReadLong(source, "inputTokens", "input_tokens", "promptTokens", "prompt_tokens", "input");
+        var output = ReadLong(source, "outputTokens", "output_tokens", "completionTokens", "completion_tokens", "output");
+        var total = ReadLong(source, "totalTokens", "total_tokens");
+        var cached = ReadLong(source, "cachedInputTokens", "cached_input_tokens", "cacheRead", "cache_read", "cachedTokens", "cached_tokens");
+        if (cached <= 0)
+        {
+            cached = ReadNestedLong(source, "inputTokensDetails", "cachedTokens", "cached_tokens")
+                + ReadNestedLong(source, "input_tokens_details", "cachedTokens", "cached_tokens")
+                + ReadNestedLong(source, "promptTokensDetails", "cachedTokens", "cached_tokens")
+                + ReadNestedLong(source, "prompt_tokens_details", "cachedTokens", "cached_tokens");
+        }
+
+        var reasoning = ReadLong(source, "reasoningOutputTokens", "reasoning_output_tokens", "reasoningTokens", "reasoning_tokens");
+        if (reasoning <= 0)
+        {
+            reasoning = ReadNestedLong(source, "outputTokensDetails", "reasoningTokens", "reasoning_tokens")
+                + ReadNestedLong(source, "output_tokens_details", "reasoningTokens", "reasoning_tokens")
+                + ReadNestedLong(source, "completionTokensDetails", "reasoningTokens", "reasoning_tokens")
+                + ReadNestedLong(source, "completion_tokens_details", "reasoningTokens", "reasoning_tokens");
+        }
+
+        if (total <= 0) total = input + output;
+        if (input <= 0 && output <= 0 && total <= 0) return false;
+
+        usage.InputTokenCount = input;
+        usage.OutputTokenCount = output;
+        usage.TotalTokenCount = total;
+        usage.CachedInputTokenCount = cached;
+        usage.ReasoningTokenCount = reasoning;
+        return true;
+    }
+
+    private static long ReadNestedLong(JsonElement element, string objectName, params string[] names)
+        => element.ValueKind == JsonValueKind.Object
+           && element.TryGetProperty(objectName, out var nested)
+           && nested.ValueKind == JsonValueKind.Object
+            ? ReadLong(nested, names)
+            : 0;
+
+    private static long ReadLong(JsonElement element, params string[] names)
+    {
+        if (element.ValueKind != JsonValueKind.Object) return 0;
+        foreach (var property in element.EnumerateObject())
+        {
+            if (!names.Any(name => string.Equals(property.Name, name, StringComparison.OrdinalIgnoreCase)))
+                continue;
+            if (property.Value.TryGetInt64(out var number)) return Math.Max(0, number);
+            if (long.TryParse(property.Value.ToString(), out number)) return Math.Max(0, number);
+        }
+        return 0;
     }
 
     private static readonly string[] ReasoningFieldNames =

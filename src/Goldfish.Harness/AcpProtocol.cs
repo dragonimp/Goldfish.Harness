@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.Extensions.AI;
 
 namespace Goldfish.Harness;
 
@@ -96,6 +97,7 @@ public sealed class GoldfishAcpEventProjector
                 or GoldfishEventKind.ReflectionCompleted
                 or GoldfishEventKind.ReWooGraphCreated
                 or GoldfishEventKind.ReasoningTraceCompleted => MessageChunk("agent_thought_chunk", ev.Delta, ev),
+            GoldfishEventKind.TokenUsage => UsageUpdate(ev),
             GoldfishEventKind.Failed => RuntimeError(ev),
             GoldfishEventKind.Completed => null,
             _ => null
@@ -147,6 +149,31 @@ public sealed class GoldfishAcpEventProjector
         rawOutput = ev.Result,
         _meta = Meta(ev)
     };
+
+    private static object UsageUpdate(GoldfishHarnessEvent ev)
+    {
+        var last = TokenBreakdown(ev.Usage);
+        return new
+        {
+            sessionUpdate = "usage_update",
+            used = last.TotalTokens,
+            size = last.TotalTokens,
+            last,
+            total = last,
+            _meta = new
+            {
+                native = new { last, total = last },
+                agentfree = new
+                {
+                    eventType = "usage_update",
+                    ev.RunId,
+                    ev.EventId,
+                    ev.Step,
+                    timestamp = ev.Timestamp.ToString("O")
+                }
+            }
+        };
+    }
 
     private static object RuntimeError(GoldfishHarnessEvent ev) => new
     {
@@ -225,6 +252,24 @@ public sealed class GoldfishAcpEventProjector
             timestamp = ev.Timestamp.ToString("O")
         }
     };
+
+    private static AcpTokenBreakdown TokenBreakdown(UsageDetails? usage)
+    {
+        var input = Math.Max(0, usage?.InputTokenCount ?? 0);
+        var cached = Math.Max(0, usage?.CachedInputTokenCount ?? 0);
+        var output = Math.Max(0, usage?.OutputTokenCount ?? 0);
+        var reasoning = Math.Max(0, usage?.ReasoningTokenCount ?? 0);
+        var total = Math.Max(0, usage?.TotalTokenCount ?? 0);
+        if (total <= 0) total = input + output;
+        return new AcpTokenBreakdown(input, cached, output, reasoning, total);
+    }
+
+    private sealed record AcpTokenBreakdown(
+        [property: JsonPropertyName("input_tokens")] long InputTokens,
+        [property: JsonPropertyName("cached_input_tokens")] long CachedInputTokens,
+        [property: JsonPropertyName("output_tokens")] long OutputTokens,
+        [property: JsonPropertyName("reasoning_output_tokens")] long ReasoningOutputTokens,
+        [property: JsonPropertyName("total_tokens")] long TotalTokens);
 
     private static string ToolCallId(GoldfishHarnessEvent ev)
         => string.IsNullOrWhiteSpace(ev.ToolCallId) ? $"{ev.Step}:{ev.ToolId ?? "tool"}" : ev.ToolCallId;

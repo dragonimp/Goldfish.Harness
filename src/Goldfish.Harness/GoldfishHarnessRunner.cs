@@ -104,6 +104,10 @@ public sealed class GoldfishHarnessRunner
             }
 
             var response = await _chatClient.GetResponseAsync(messages, BuildChatOptions(request, toolFunctions), ct);
+            if (response.Usage is not null)
+            {
+                result.Events.Add(GoldfishHarnessEvent.TokenUsage(step, response.Usage));
+            }
             var raw = response.Text?.Trim() ?? string.Empty;
             var functionCalls = response.Messages
                 .SelectMany(m => m.Contents)
@@ -323,6 +327,11 @@ public sealed class GoldfishHarnessRunner
             {
                 updates.Add(update);
 
+                foreach (var usage in update.Contents.OfType<UsageContent>())
+                {
+                    yield return GoldfishHarnessEvent.TokenUsage(step, usage.Details);
+                }
+
                 foreach (var reasoning in update.Contents.OfType<TextReasoningContent>())
                 {
                     if (!string.IsNullOrWhiteSpace(reasoning.Text))
@@ -514,6 +523,11 @@ public sealed class GoldfishHarnessRunner
         messages.Add(new MsChatMessage(ChatRole.User, "请停止继续调用工具，基于已有观察给出最终回答。"));
         await foreach (var update in _chatClient.GetStreamingResponseAsync(messages, BuildChatOptions(request, new Dictionary<string, ToolFunction>()), ct))
         {
+            foreach (var usage in update.Contents.OfType<UsageContent>())
+            {
+                yield return GoldfishHarnessEvent.TokenUsage(_maxReactSteps + 1, usage.Details);
+            }
+
             foreach (var reasoning in update.Contents.OfType<TextReasoningContent>())
             {
                 if (!string.IsNullOrWhiteSpace(reasoning.Text))
@@ -2077,6 +2091,7 @@ public enum GoldfishEventKind
     ReflectionCompleted,
     ReWooGraphCreated,
     ReasoningTraceCompleted,
+    TokenUsage,
     Completed,
     Failed,
 }
@@ -2098,6 +2113,7 @@ public sealed record GoldfishHarnessEvent
     public bool? Success { get; init; }
     public IReadOnlyList<object>? Attachments { get; init; }
     public ReasoningStrategySelection? ReasoningSelection { get; init; }
+    public UsageDetails? Usage { get; init; }
 
     public static GoldfishHarnessEvent RunStarted(string runId) => new()
     {
@@ -2125,6 +2141,13 @@ public sealed record GoldfishHarnessEvent
         Kind = GoldfishEventKind.Completed,
         Step = step,
         Delta = answer
+    };
+
+    public static GoldfishHarnessEvent TokenUsage(int step, UsageDetails usage) => new()
+    {
+        Kind = GoldfishEventKind.TokenUsage,
+        Step = step,
+        Usage = usage
     };
 
     public static GoldfishHarnessEvent Failed(int step, string error) => new()

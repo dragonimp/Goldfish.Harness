@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Goldfish.Harness;
+using Microsoft.Extensions.AI;
 using Xunit;
 
 namespace Goldfish.Harness.Tests;
@@ -58,6 +59,32 @@ public sealed class AcpProtocolTests
         var update = json.GetProperty("params").GetProperty("update");
         Assert.Equal("agent_message_chunk", update.GetProperty("sessionUpdate").GetString());
         Assert.Equal("_agentfree/runtime.error", update.GetProperty("_meta").GetProperty("agentfree").GetProperty("eventType").GetString());
+    }
+
+    [Fact]
+    public void TokenUsage_ProjectsToStandardUsageUpdate()
+    {
+        var usage = new UsageDetails
+        {
+            InputTokenCount = 101,
+            CachedInputTokenCount = 70,
+            OutputTokenCount = 23,
+            ReasoningTokenCount = 9,
+            TotalTokenCount = 124
+        };
+
+        var frame = Assert.Single(_projector.Project("session-usage", GoldfishHarnessEvent.TokenUsage(1, usage)));
+        var json = JsonSerializer.SerializeToElement(frame, GoldfishAcpProtocol.JsonOptions);
+        var update = json.GetProperty("params").GetProperty("update");
+        var last = update.GetProperty("last");
+
+        Assert.Equal("usage_update", update.GetProperty("sessionUpdate").GetString());
+        Assert.Equal(124, update.GetProperty("used").GetInt64());
+        Assert.Equal(101, last.GetProperty("input_tokens").GetInt64());
+        Assert.Equal(70, last.GetProperty("cached_input_tokens").GetInt64());
+        Assert.Equal(23, last.GetProperty("output_tokens").GetInt64());
+        Assert.Equal(9, last.GetProperty("reasoning_output_tokens").GetInt64());
+        Assert.Equal("usage_update", update.GetProperty("_meta").GetProperty("agentfree").GetProperty("eventType").GetString());
     }
 
     [Fact]
