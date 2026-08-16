@@ -174,7 +174,7 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
                 Id = runtime.AgentId,
                 Name = runtime.AgentName,
                 Description = runtime.Description,
-                AgentType = "Goldfish",
+                AgentType = runtime.AgentType,
                 SystemPrompt = runtime.SystemPrompt
             },
             session.SessionId,
@@ -279,6 +279,7 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
         }
 
         return new HostRuntime(
+            ReadString(runtime, "agentType") ?? "Goldfish",
             ReadString(runtime, "baseUrl") ?? "https://api.openai.com/v1",
             ReadString(runtime, "apiKey") ?? string.Empty,
             ReadString(runtime, "model") ?? "gpt-4o-mini",
@@ -384,6 +385,7 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
 internal sealed record HostSession(string SessionId, string Cwd, HostRuntime Runtime);
 
 internal sealed record HostRuntime(
+    string AgentType,
     string BaseUrl,
     string ApiKey,
     string Model,
