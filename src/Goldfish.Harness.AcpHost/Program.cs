@@ -506,7 +506,7 @@ internal static class HostToolRegistry
         }));
         registry.Register(new DelegateTool("get_gateway_context", "get_gateway_context", "读取当前请求的脱敏平台上下文。", "{\"type\":\"object\",\"additionalProperties\":false}", _ =>
             Task.FromResult(new ToolResult { Success = true, Data = context, DisplayText = string.Join('\n', context.Select(item => $"{item.Key}: {item.Value}")) })));
-        await HostMcpToolLoader.RegisterAsync(registry, mcpServers, ct);
+        await HostMcpToolLoader.RegisterAsync(registry, mcpServers, context, ct);
         return registry;
     }
 

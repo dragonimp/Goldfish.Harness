@@ -1,12 +1,19 @@
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Goldfish.Harness;
 
 internal static class HostMcpToolLoader
 {
-    public static async Task RegisterAsync(ToolRegistry registry, IReadOnlyList<HostMcpServer> servers, CancellationToken ct)
+    public static async Task RegisterAsync(
+        ToolRegistry registry,
+        IReadOnlyList<HostMcpServer> servers,
+        IReadOnlyDictionary<string, string> context,
+        CancellationToken ct)
     {
+        context.TryGetValue("caller.username", out var currentUsername);
+        currentUsername = string.IsNullOrWhiteSpace(currentUsername) ? null : currentUsername.Trim();
         foreach (var server in servers)
         {
             var tools = await HostMcpClient.ListToolsAsync(server, ct);
@@ -18,8 +25,28 @@ internal static class HostMcpToolLoader
                     ? replacement
                     : Read(tool, "description") ?? name;
                 var schema = tool.TryGetProperty("inputSchema", out var inputSchema) ? inputSchema.GetRawText() : "{}";
-                registry.Register(new HostMcpTool(server, name, description, schema));
+                registry.Register(new HostMcpTool(
+                    server,
+                    name,
+                    description,
+                    schema,
+                    DeclaresUsername(schema) ? currentUsername : null));
             }
+        }
+    }
+
+    private static bool DeclaresUsername(string schema)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(schema);
+            return document.RootElement.TryGetProperty("properties", out var properties)
+                && properties.ValueKind == JsonValueKind.Object
+                && properties.TryGetProperty("username", out _);
+        }
+        catch (JsonException)
+        {
+            return false;
         }
     }
 
@@ -31,7 +58,8 @@ internal sealed class HostMcpTool(
     HostMcpServer server,
     string name,
     string description,
-    string schema) : ITool
+    string schema,
+    string? currentUsername) : ITool
 {
     public string Id => name;
     public string Name => name;
@@ -43,7 +71,14 @@ internal sealed class HostMcpTool(
     {
         try
         {
-            var result = await HostMcpClient.CallToolAsync(server, name, arguments, CancellationToken.None);
+            var forwardedArguments = arguments;
+            if (!string.IsNullOrWhiteSpace(currentUsername))
+            {
+                var payload = JsonNode.Parse(string.IsNullOrWhiteSpace(arguments) ? "{}" : arguments) as JsonObject ?? new JsonObject();
+                payload["username"] = currentUsername;
+                forwardedArguments = payload.ToJsonString();
+            }
+            var result = await HostMcpClient.CallToolAsync(server, name, forwardedArguments, CancellationToken.None);
             return new ToolResult { Success = !result.IsError, Data = result.Payload, DisplayText = result.Text, Error = result.IsError ? result.Text : null };
         }
         catch (Exception ex)
