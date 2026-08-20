@@ -168,15 +168,19 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
             new InMemoryMemoryManager(),
             memoryOptions,
             new GoldfishSessionQueue());
+        var agentInfo = new AgentInfo
+        {
+            Id = runtime.AgentId,
+            Name = runtime.AgentName,
+            Description = runtime.Description,
+            AgentType = runtime.AgentType,
+            SystemPrompt = runtime.SystemPrompt,
+            // The AgentNode supplies a sanitized, runtime-scoped context.  Keep
+            // it available to the Harness prompt builder as well as MCP tools.
+            ExtraData = new Dictionary<string, string>(runtime.Context, StringComparer.OrdinalIgnoreCase)
+        };
         var request = new GoldfishHarnessSessionRequest(
-            new AgentInfo
-            {
-                Id = runtime.AgentId,
-                Name = runtime.AgentName,
-                Description = runtime.Description,
-                AgentType = runtime.AgentType,
-                SystemPrompt = runtime.SystemPrompt
-            },
+            agentInfo,
             session.SessionId,
             prompt,
             runtime.MemoryPartition with { SessionId = session.SessionId },

@@ -32,7 +32,10 @@ public sealed record GoldfishRunContext
             DisableConfigCache = disableConfigCache,
             User = new GoldfishUserContext
             {
-                Name = Get("SenderName") ?? "未知用户",
+                // caller.username is the canonical User Center identity passed
+                // through AgentNode.  It intentionally takes precedence over a
+                // transport display name and never derives from an internal ID.
+                Name = First("caller.username", "CallerUsername", "SenderName") ?? "未知用户",
                 Id = Get("UserId") ?? "未知",
                 Role = Get("UserRole") ?? "未知"
             },
