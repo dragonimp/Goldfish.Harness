@@ -43,8 +43,10 @@ trap cleanup EXIT
 }
 
 mv "$STAGING_DIR" "$RELEASE_DIR"
-ln -s "$RELEASE_DIR" "$CURRENT_LINK.next"
-mv -f "$CURRENT_LINK.next" "$CURRENT_LINK"
+# BSD mv follows a destination symlink to a directory, so it can place the
+# temporary link inside the old release instead of replacing `current`.
+# ln -sfn replaces the symlink itself on macOS without dereferencing it.
+ln -sfn "$RELEASE_DIR" "$CURRENT_LINK"
 
 # This is configuration, not an AgentNode binary update. Future AgentNode
 # deployments preserve the same key in their generated plist.
