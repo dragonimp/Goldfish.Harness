@@ -19,7 +19,9 @@ public sealed class ReasoningOptions
 {
     public static ReasoningOptions Default { get; } = new();
 
-    public ReasoningStrategyKind Strategy { get; set; } = ReasoningStrategyKind.Auto;
+    // Keep the normal path to one model request. Auto is an opt-in mode because
+    // its classifier requires a separate model preflight before execution.
+    public ReasoningStrategyKind Strategy { get; set; } = ReasoningStrategyKind.ReAct;
     public bool EnableReflexion { get; set; } = true;
     public int MaxReasoningSteps { get; set; } = 12;
     public int MaxPlanSteps { get; set; } = 20;

@@ -91,6 +91,13 @@ public sealed class GoldfishHarnessRunnerTests
     }
 
     [Fact]
+    public void ReasoningOptions_DefaultsToReact()
+    {
+        Assert.Equal(ReasoningStrategyKind.ReAct, ReasoningOptions.Default.Strategy);
+        Assert.Equal(ReasoningStrategyKind.ReAct, new ReasoningOptions().Strategy);
+    }
+
+    [Fact]
     public void ReasoningStrategySelector_AutoHonorsUserDirectedPlanMode()
     {
         var selection = ReasoningStrategySelector.Select(
@@ -152,6 +159,25 @@ public sealed class GoldfishHarnessRunnerTests
         Assert.Equal(ReasoningStrategyKind.ReAct, selection.Effective);
         Assert.StartsWith("auto-classifier:0.90", selection.Reason);
         Assert.Single(chatClient.Calls);
+    }
+
+    [Fact]
+    public async Task ReasoningStrategyDecider_DefaultOptionsSkipsClassifier()
+    {
+        var chatClient = new QueueChatClient();
+        var decider = new DefaultReasoningStrategyDecider(chatClient);
+
+        var selection = await decider.SelectAsync(
+            new ReasoningStrategyDecisionRequest(
+                "session-1",
+                "包含多个步骤的普通请求",
+                Options: null),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(ReasoningStrategyKind.ReAct, selection.Requested);
+        Assert.Equal(ReasoningStrategyKind.ReAct, selection.Effective);
+        Assert.Equal("request-explicit", selection.Reason);
+        Assert.Empty(chatClient.Calls);
     }
 
     [Fact]

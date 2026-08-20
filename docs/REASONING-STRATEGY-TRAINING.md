@@ -12,8 +12,8 @@
 
 Goldfish Harness 当前把“怎么推理”拆成可观测、可切换的会话策略：
 
-- `auto`：默认模式，由系统自动选择 `react` / `plan` / `rewoo`。
-- `react`：边想边做，适合短任务和单链路工具调用。
+- `react`：默认模式，边想边做，适合短任务和单链路工具调用。
+- `auto`：按需启用，由系统自动选择 `react` / `plan` / `rewoo`。
 - `plan`：先规划再执行，适合多步骤长任务。
 - `rewoo`：先形成工具调用图再汇总，适合多信息源、多工具依赖明显的任务。
 - `reflexion=on|off`：控制失败/异常/用户纠错后的反思修正层。
@@ -74,7 +74,7 @@ Goldfish Harness 当前把“怎么推理”拆成可观测、可切换的会话
 
 ### 3.1 策略选择入口
 
-Goldfish Harness 每次执行都会先选择推理策略，然后把策略选择结果写入事件流：
+Goldfish Harness 每次执行都会记录最终生效的推理策略。默认直接使用 ReAct，不会调用策略分类模型；仅在会话显式切换到 `auto` 后才会自动选择并调用分类模型。
 
 ```text
 已选择推理策略：PlanAndExecute（Auto / auto-classifier:0.82:multi-step task / Reflexion=开启）
@@ -89,7 +89,7 @@ Goldfish Harness 每次执行都会先选择推理策略，然后把策略选择
 
 ### 3.2 Auto 策略不是写死关键词
 
-`auto` 的选择顺序是：
+显式启用 `auto` 后，选择顺序是：
 
 1. 如果用户本轮明确要求“走/使用/采用某种策略”，优先按用户要求生效；
 2. 否则，每一轮都调用大模型分类器，让它只输出策略 JSON；
