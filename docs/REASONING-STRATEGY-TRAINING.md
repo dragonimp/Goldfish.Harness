@@ -660,11 +660,15 @@ ReWOO 的工具图节点仍必须逐个经过授权 hook。
 - Agent：`36`
 - 绑定节点：`mac-goldfish-harness`
 - 地址：`http://mac.t.impx.net:8651`
-- 更新命令：
+- Harness 独立更新命令：
 
 ```bash
-bash deploy/local/start-goldfish-harness-agent-node.sh
+bash deploy/local/deploy-goldfish-harness-acp.sh
 ```
+
+该脚本只发布 `Goldfish.Harness.AcpHost` 到独立版本目录，并将 AgentNode 的
+`GoldfishHarnessAcp__Command` 指向稳定的 `current` 路径。它不会编译或发布
+`Goldfish.AgentNode`；最后仅重启既有 AgentNode，以重新建立 stdio ACP 子进程。
 
 验证链路：
 
