@@ -55,6 +55,9 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
                         case "session/cancel":
                             await CancelSessionAsync(id, request);
                             break;
+                        case "session/reset":
+                            await ResetSessionAsync(id, request);
+                            break;
                         case "shutdown":
                             foreach (var run in _activeRuns.Values) run.Cancel();
                             await WriteAsync(GoldfishAcpProtocol.Response(id, new { }));
@@ -111,13 +114,14 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
         }
 
         var prompt = ReadPrompt(parameters);
+        var promptContext = ReadPromptContext(parameters);
         _ = Task.Run(async () =>
         {
             Exception? failure = null;
             var stopReason = "end_turn";
             try
             {
-                await ExecutePromptAsync(session, prompt, run.Token);
+                await ExecutePromptAsync(session, prompt, promptContext, run.Token);
             }
             catch (OperationCanceledException)
             {
@@ -144,7 +148,11 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
         });
     }
 
-    private async Task ExecutePromptAsync(HostSession session, string prompt, CancellationToken ct)
+    private async Task ExecutePromptAsync(
+        HostSession session,
+        string prompt,
+        IReadOnlyDictionary<string, string> promptContext,
+        CancellationToken ct)
     {
         var runtime = session.Runtime;
         using var chatClient = new WhitespacePreservingOpenAiChatClient(
@@ -177,7 +185,7 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
             SystemPrompt = runtime.SystemPrompt,
             // The AgentNode supplies a sanitized, runtime-scoped context.  Keep
             // it available to the Harness prompt builder as well as MCP tools.
-            ExtraData = new Dictionary<string, string>(runtime.Context, StringComparer.OrdinalIgnoreCase)
+            ExtraData = MergeContext(runtime.Context, promptContext)
         };
         var request = new GoldfishHarnessSessionRequest(
             agentInfo,
@@ -211,6 +219,21 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
             await run.Completion.Task;
         }
         await WriteAsync(GoldfishAcpProtocol.Response(id, new { cancelled }));
+    }
+
+    private async Task ResetSessionAsync(JsonElement? id, JsonElement request)
+    {
+        var parameters = RequiredObject(request, "params");
+        var sessionId = ReadString(parameters, "sessionId")
+            ?? throw new InvalidOperationException("session/reset requires sessionId.");
+        if (_activeRuns.TryGetValue(sessionId, out var run))
+        {
+            run.Cancel();
+            await run.Completion.Task;
+        }
+
+        var reset = _sessions.TryRemove(sessionId, out _);
+        await WriteAsync(GoldfishAcpProtocol.Response(id, new { reset, sessionId }));
     }
 
     private sealed class ActiveRun : IDisposable
@@ -328,6 +351,27 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
                 text.Append(ReadString(block, "text"));
         }
         return text.ToString();
+    }
+
+    private static IReadOnlyDictionary<string, string> ReadPromptContext(JsonElement parameters)
+    {
+        if (!parameters.TryGetProperty("_meta", out var meta) || meta.ValueKind != JsonValueKind.Object
+            || !meta.TryGetProperty("agentfree", out var agentfree) || agentfree.ValueKind != JsonValueKind.Object)
+            return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        return ReadStringMap(agentfree, "context");
+    }
+
+    private static Dictionary<string, string> MergeContext(
+        IReadOnlyDictionary<string, string> runtimeContext,
+        IReadOnlyDictionary<string, string> promptContext)
+    {
+        var merged = new Dictionary<string, string>(runtimeContext, StringComparer.OrdinalIgnoreCase);
+        foreach (var (key, value) in promptContext)
+        {
+            if (!string.IsNullOrWhiteSpace(key) && !string.IsNullOrWhiteSpace(value))
+                merged[key] = value;
+        }
+        return merged;
     }
 
     private static JsonElement RequiredObject(JsonElement root, string name)
