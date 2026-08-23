@@ -14,18 +14,39 @@ public enum GoldfishTurnStatus
     Running,
     Completed,
     Failed,
-    Canceled
+    Canceled,
+    Orphaned
 }
 
 public sealed record GoldfishHarnessTurn
 {
     public string TurnId { get; init; } = Guid.NewGuid().ToString("n");
+    public string RequestId { get; init; } = Guid.NewGuid().ToString("n");
+    public string RunId { get; init; } = string.Empty;
+    public string TenantId { get; init; } = string.Empty;
+    public string UserId { get; init; } = string.Empty;
+    public string AgentId { get; init; } = string.Empty;
+    public string WorkspaceId { get; init; } = string.Empty;
     public string SessionId { get; init; } = string.Empty;
+    public string Strategy { get; init; } = nameof(ReasoningStrategyKind.ReAct);
+    public string? RetryOfTurnId { get; init; }
     public GoldfishTurnStatus Status { get; init; } = GoldfishTurnStatus.Queued;
     public DateTimeOffset CreatedAt { get; init; } = DateTimeOffset.UtcNow;
     public DateTimeOffset? StartedAt { get; init; }
     public DateTimeOffset? CompletedAt { get; init; }
+    public DateTimeOffset? HeartbeatAt { get; init; }
+    public DateTimeOffset? LeaseExpiresAt { get; init; }
+    public string? LeaseOwner { get; init; }
+    public int Version { get; init; }
+    public string? TerminalReasonCode { get; init; }
     public string? TerminalReason { get; init; }
+
+    public bool IsTerminal => Status is GoldfishTurnStatus.Completed
+        or GoldfishTurnStatus.Failed
+        or GoldfishTurnStatus.Canceled
+        or GoldfishTurnStatus.Orphaned;
+
+    public GoldfishTurnPartition Partition => new(TenantId, UserId, AgentId, WorkspaceId, SessionId);
 }
 
 public sealed record GoldfishHarnessTurnEvent(
