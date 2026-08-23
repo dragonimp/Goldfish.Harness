@@ -2061,7 +2061,8 @@ public sealed record GoldfishHarnessRequest(
     IToolExecutionStore? ToolExecutionStore = null,
     IToolAuthorizationHook? ToolAuthorizationHook = null,
     ReasoningOptions? ReasoningOptions = null,
-    ReasoningStrategySelection? CachedReasoningSelection = null);
+    ReasoningStrategySelection? CachedReasoningSelection = null,
+    string? QueueKey = null);
 
 public interface IGoldfishSteerSource
 {

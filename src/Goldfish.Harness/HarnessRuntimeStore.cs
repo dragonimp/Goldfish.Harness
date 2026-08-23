@@ -67,6 +67,16 @@ public interface IHarnessRuntimeStore
         string? assistantMessage,
         CancellationToken ct = default);
 
+    Task<bool> TryCompleteWithEventAsync(
+        string turnId,
+        string sessionId,
+        GoldfishHarnessEvent terminalEvent,
+        GoldfishTurnStatus status,
+        string? terminalReasonCode,
+        string? terminalReason,
+        string? assistantMessage,
+        CancellationToken ct = default);
+
     Task HeartbeatAsync(
         string turnId,
         string leaseOwner,

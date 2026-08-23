@@ -45,7 +45,8 @@ public sealed class GoldfishSessionQueue
         if (string.IsNullOrWhiteSpace(request.SessionId))
             throw new ArgumentException("SessionId is required.", nameof(request));
 
-        var state = _sessions.GetOrAdd(request.SessionId, static id => new SessionState(id));
+        var queueKey = string.IsNullOrWhiteSpace(request.QueueKey) ? request.SessionId : request.QueueKey;
+        var state = _sessions.GetOrAdd(queueKey, static id => new SessionState(id));
         var item = new QueueItem(
             string.IsNullOrWhiteSpace(messageId) ? Guid.NewGuid().ToString("n") : messageId,
             request, execute,
@@ -62,7 +63,7 @@ public sealed class GoldfishSessionQueue
             }
         }
 
-        return new GoldfishQueueSubmission(item.Id, request.SessionId, position, ReadEvents(item));
+        return new GoldfishQueueSubmission(item.Id, queueKey, position, ReadEvents(item));
     }
 
     /// <summary>

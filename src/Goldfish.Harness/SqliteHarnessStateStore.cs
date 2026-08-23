@@ -130,43 +130,7 @@ public sealed class SqliteHarnessStateStore : ISkillSessionStore, IToolExecution
             await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(ct);
             var sequence = await NextSequenceAsync(connection, transaction, turnId, ct);
             foreach (var ev in events)
-            {
-                var json = JsonSerializer.Serialize(ev, HarnessRuntimeJson.Options);
-                var bytes = Encoding.UTF8.GetBytes(json);
-                string payload;
-                string? blobId = null;
-                if (bytes.Length > _options.InlinePayloadBytes)
-                {
-                    blobId = Guid.NewGuid().ToString("n");
-                    await InsertBlobAsync(connection, transaction, blobId, turnId, bytes, ev.Timestamp, ct);
-                    payload = JsonSerializer.Serialize(new { blobId, sha256 = Hash(bytes), length = bytes.Length });
-                }
-                else
-                {
-                    payload = json;
-                }
-
-                await using var command = connection.CreateCommand();
-                command.Transaction = transaction;
-                command.CommandText = """
-                    INSERT INTO goldfish_turn_events (
-                        event_id, turn_id, session_id, sequence, event_kind, step,
-                        payload_json, payload_hash, blob_id, created_at)
-                    VALUES ($event_id, $turn_id, $session_id, $sequence, $event_kind, $step,
-                        $payload_json, $payload_hash, $blob_id, $created_at);
-                    """;
-                command.Parameters.AddWithValue("$event_id", ev.EventId);
-                command.Parameters.AddWithValue("$turn_id", turnId);
-                command.Parameters.AddWithValue("$session_id", sessionId);
-                command.Parameters.AddWithValue("$sequence", sequence++);
-                command.Parameters.AddWithValue("$event_kind", ev.Kind.ToString());
-                command.Parameters.AddWithValue("$step", ev.Step);
-                command.Parameters.AddWithValue("$payload_json", payload);
-                command.Parameters.AddWithValue("$payload_hash", Hash(bytes));
-                command.Parameters.AddWithValue("$blob_id", (object?)blobId ?? DBNull.Value);
-                command.Parameters.AddWithValue("$created_at", ev.Timestamp.ToString("O"));
-                await command.ExecuteNonQueryAsync(ct);
-            }
+                await InsertEventAsync(connection, transaction, turnId, sessionId, sequence++, ev, ct);
             await transaction.CommitAsync(ct);
         }
         finally
@@ -224,6 +188,74 @@ public sealed class SqliteHarnessStateStore : ISkillSessionStore, IToolExecution
                 message.Parameters.AddWithValue("$content", assistantMessage);
                 message.Parameters.AddWithValue("$created_at", DateTimeOffset.UtcNow.ToString("O"));
                 await message.ExecuteNonQueryAsync(ct);
+            }
+            await transaction.CommitAsync(ct);
+            return changed;
+        }
+        finally
+        {
+            _writerLock.Release();
+        }
+    }
+
+    public async Task<bool> TryCompleteWithEventAsync(
+        string turnId,
+        string sessionId,
+        GoldfishHarnessEvent terminalEvent,
+        GoldfishTurnStatus status,
+        string? terminalReasonCode,
+        string? terminalReason,
+        string? assistantMessage,
+        CancellationToken ct = default)
+    {
+        if (terminalEvent.Kind is not (GoldfishEventKind.Completed or GoldfishEventKind.Failed))
+            throw new ArgumentException("A terminal Harness event is required.", nameof(terminalEvent));
+        if (status is not (GoldfishTurnStatus.Completed or GoldfishTurnStatus.Failed
+            or GoldfishTurnStatus.Canceled or GoldfishTurnStatus.Orphaned))
+            throw new ArgumentOutOfRangeException(nameof(status));
+
+        ThrowIfDisposed();
+        await _writerLock.WaitAsync(ct);
+        try
+        {
+            await using var connection = OpenConnection();
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(ct);
+            await using var update = connection.CreateCommand();
+            update.Transaction = transaction;
+            update.CommandText = """
+                UPDATE goldfish_turns
+                SET status = $status, completed_at = $completed_at,
+                    terminal_reason_code = $reason_code, terminal_reason = $reason,
+                    lease_owner = NULL, lease_expires_at = NULL, version = version + 1
+                WHERE turn_id = $turn_id AND status IN ('Queued', 'Running');
+                """;
+            update.Parameters.AddWithValue("$status", status.ToString());
+            update.Parameters.AddWithValue("$completed_at", DateTimeOffset.UtcNow.ToString("O"));
+            update.Parameters.AddWithValue("$reason_code", (object?)terminalReasonCode ?? DBNull.Value);
+            update.Parameters.AddWithValue("$reason", (object?)terminalReason ?? DBNull.Value);
+            update.Parameters.AddWithValue("$turn_id", turnId);
+            var changed = await update.ExecuteNonQueryAsync(ct) == 1;
+            if (changed)
+            {
+                var sequence = await NextSequenceAsync(connection, transaction, turnId, ct);
+                await InsertEventAsync(connection, transaction, turnId, sessionId, sequence, terminalEvent, ct);
+                if (status == GoldfishTurnStatus.Completed && assistantMessage is not null)
+                {
+                    await using var message = connection.CreateCommand();
+                    message.Transaction = transaction;
+                    message.CommandText = """
+                        INSERT OR IGNORE INTO memory_messages (
+                            tenant_id, user_id, agent_id, workspace_id, session_id,
+                            turn_id, message_sequence, role, content, created_at)
+                        SELECT tenant_id, user_id, agent_id, workspace_id, session_id,
+                            turn_id, 1, 'assistant', $content, $created_at
+                        FROM goldfish_turns WHERE turn_id = $turn_id;
+                        """;
+                    message.Parameters.AddWithValue("$turn_id", turnId);
+                    message.Parameters.AddWithValue("$content", assistantMessage);
+                    message.Parameters.AddWithValue("$created_at", DateTimeOffset.UtcNow.ToString("O"));
+                    await message.ExecuteNonQueryAsync(ct);
+                }
             }
             await transaction.CommitAsync(ct);
             return changed;
@@ -735,6 +767,52 @@ public sealed class SqliteHarnessStateStore : ISkillSessionStore, IToolExecution
         command.Parameters.AddWithValue("$hash", Hash(content));
         command.Parameters.AddWithValue("$length", content.Length);
         command.Parameters.AddWithValue("$created_at", createdAt.ToString("O"));
+        await command.ExecuteNonQueryAsync(ct);
+    }
+
+    private async Task InsertEventAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string turnId,
+        string sessionId,
+        long sequence,
+        GoldfishHarnessEvent ev,
+        CancellationToken ct)
+    {
+        var json = JsonSerializer.Serialize(ev, HarnessRuntimeJson.Options);
+        var bytes = Encoding.UTF8.GetBytes(json);
+        string payload;
+        string? blobId = null;
+        if (bytes.Length > _options.InlinePayloadBytes)
+        {
+            blobId = Guid.NewGuid().ToString("n");
+            await InsertBlobAsync(connection, transaction, blobId, turnId, bytes, ev.Timestamp, ct);
+            payload = JsonSerializer.Serialize(new { blobId, sha256 = Hash(bytes), length = bytes.Length });
+        }
+        else
+        {
+            payload = json;
+        }
+
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO goldfish_turn_events (
+                event_id, turn_id, session_id, sequence, event_kind, step,
+                payload_json, payload_hash, blob_id, created_at)
+            VALUES ($event_id, $turn_id, $session_id, $sequence, $event_kind, $step,
+                $payload_json, $payload_hash, $blob_id, $created_at);
+            """;
+        command.Parameters.AddWithValue("$event_id", ev.EventId);
+        command.Parameters.AddWithValue("$turn_id", turnId);
+        command.Parameters.AddWithValue("$session_id", sessionId);
+        command.Parameters.AddWithValue("$sequence", sequence);
+        command.Parameters.AddWithValue("$event_kind", ev.Kind.ToString());
+        command.Parameters.AddWithValue("$step", ev.Step);
+        command.Parameters.AddWithValue("$payload_json", payload);
+        command.Parameters.AddWithValue("$payload_hash", Hash(bytes));
+        command.Parameters.AddWithValue("$blob_id", (object?)blobId ?? DBNull.Value);
+        command.Parameters.AddWithValue("$created_at", ev.Timestamp.ToString("O"));
         await command.ExecuteNonQueryAsync(ct);
     }
 
