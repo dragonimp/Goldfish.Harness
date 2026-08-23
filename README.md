@@ -18,9 +18,9 @@ dotnet build Goldfish.Harness.slnx -c Release
 - `src/Goldfish.Harness`: class library targeting `.NET 10`
 - `src/Goldfish.Harness.AcpHost`: independent stdio ACP host targeting `.NET 10`
 - `GoldfishHarnessRunner`: main entry point for non-streaming and streaming runs
-- `GoldfishHarnessKernel`: transport-neutral turn lifecycle and terminal-state boundary
+- `GoldfishHarnessRuntime`: process-scoped durable turn engine and local partition queue
 - `GoldfishHarnessContextAssembler`: persisted history and memory assembly boundary
-- `IHarnessTurnEventStore`: append-only turn event ledger; ACP is an event projector, not the source of truth
+- `IHarnessRuntimeStore`: durable turn, event, lease, replay, reset, and retention boundary
 - `IToolRegistry` / `ITool`: tool loading and invocation contracts
 - `GoldfishHarnessEvent`: strongly typed stream event model
 
@@ -33,16 +33,24 @@ AgentFree references this project as a sibling checkout:
 ## Harness kernel
 
 The runtime owns its harness implementation; it does not wrap Microsoft Agent
-Framework or Codex. `GoldfishHarnessSessionExecutor` assembles durable
-conversation context, serializes work per session, and delegates the turn to
-`GoldfishHarnessKernel`. The kernel records every emitted event and one explicit
-terminal state (`Completed`, `Failed`, or `Canceled`) before an ACP adapter
-projects the same event stream to the caller.
+Framework or Codex. `GoldfishHarnessRuntime` owns the full-partition local queue,
+request idempotency, bounded event stream, lease heartbeat, SQLite persistence,
+crash recovery, and immutable terminal state. `GoldfishHarnessSessionExecutor`
+remains as a compatibility facade for embedded callers.
 
-The standalone ACP host stores this append-only ledger at
-`<stateRoot>/turn-events.jsonl`. It contains event metadata and execution
-results, so `stateRoot` must remain inside the selected runtime isolation
-boundary and must not be shared across users.
+The standalone ACP host uses `<stateRoot>/harness-state.db` as the durable source
+of truth. `Dual` mode also appends `<stateRoot>/turn-events.jsonl` during the
+staged migration and imports recent legacy JSONL entries idempotently. Terminal
+events, assistant messages, and terminal state are committed together. Expired
+running leases become `Orphaned` and are never replayed automatically.
+
+State behavior is configured through `HarnessState__Mode` (`Jsonl`, `Dual`, or
+`Sqlite`), `HarnessState__RetentionDays` (default 30),
+`HarnessState__DeltaBatchMilliseconds` (50), `HarnessState__DeltaBatchBytes`
+(4096), and `HarnessState__LeaseSeconds` (30). The local deployment starts in
+`Dual` mode. Event and tool business payloads remain available for 30 days;
+credentials, authorization headers, tokens, passwords, and authorization codes
+are redacted before persistence.
 
 ## ACP host
 
@@ -56,8 +64,14 @@ dotnet publish src/Goldfish.Harness.AcpHost/Goldfish.Harness.AcpHost.csproj -c R
 The host exchanges one JSON-RPC frame per line over standard input and output.
 Diagnostics go to standard error so they cannot corrupt the ACP stream. It
 supports `initialize`, `session/new`, `session/prompt`, `session/cancel`, and
-`shutdown`. Harness text, reasoning, tool lifecycle, attachment, and runtime
+`session/reset` plus `shutdown`. Harness text, reasoning, tool lifecycle, attachment, and runtime
 error events are projected to ACP `session/update` notifications.
+
+`session/prompt` accepts stable execution metadata under `_meta.agentfree`:
+`turnId`, `requestId`, `retryOfTurnId`, `source`, `context`, and nested
+`reasoning.strategy`. ReAct remains the default. Auto classification is used
+only when the metadata explicitly requests `auto`; normal prompt text does not
+change the configured strategy.
 
 `session/new` requires an absolute `cwd` and runtime configuration under
 `_meta.agentfree.runtime`:
@@ -244,9 +258,10 @@ Use `SqliteHarnessStateStore` when this state should survive process restarts.
 Tool execution results are part of the current model loop only. They are not
 stored as long-term user profile memory, and medium-term compression defaults to
 `user` and `assistant` roles only. Hosts that need replay, debugging, or audit
-can pass an `IToolExecutionStore`; the harness records run/session partition,
-tool id, success state, authorization decision, timestamps, and SHA-256 hashes
-of arguments/results without persisting raw tool payloads.
+can pass an `IToolExecutionStore`; the harness records the owning Turn,
+run/session partition, tool id, success state, authorization decision,
+timestamps, hashes, redacted arguments/results, `structuredContent`, and
+`isError`. Raw credentials are never persisted.
 `SqliteHarnessStateStore` implements both `ISkillSessionStore` and
 `IToolExecutionStore`.
 

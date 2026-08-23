@@ -494,16 +494,26 @@ public sealed class SqliteHarnessStateStore : ISkillSessionStore, IToolExecution
             await using var command = connection.CreateCommand();
             command.CommandText = """
                 INSERT INTO goldfish_tool_executions (
-                    id, run_id, session_id, tenant_id, user_id, agent_id, workspace_id,
+                    id, turn_id, run_id, session_id, tenant_id, user_id, agent_id, workspace_id,
                     step, tool_call_id, tool_id, arguments_hash, result_hash, success,
-                    error, authorization_decision, started_at, completed_at
+                    arguments_json, result_json, structured_content_json, is_error,
+                    status, error, authorization_decision, started_at, completed_at
                 ) VALUES (
-                    $id, $run_id, $session_id, $tenant_id, $user_id, $agent_id, $workspace_id,
+                    $id, $turn_id, $run_id, $session_id, $tenant_id, $user_id, $agent_id, $workspace_id,
                     $step, $tool_call_id, $tool_id, $arguments_hash, $result_hash, $success,
-                    $error, $authorization_decision, $started_at, $completed_at
-                );
+                    $arguments_json, $result_json, $structured_content_json, $is_error,
+                    $status, $error, $authorization_decision, $started_at, $completed_at
+                )
+                ON CONFLICT(id) DO UPDATE SET
+                    result_hash = excluded.result_hash, success = excluded.success,
+                    result_json = excluded.result_json,
+                    structured_content_json = excluded.structured_content_json,
+                    is_error = excluded.is_error, status = excluded.status,
+                    error = excluded.error, authorization_decision = excluded.authorization_decision,
+                    completed_at = excluded.completed_at;
                 """;
-            command.Parameters.AddWithValue("$id", Guid.NewGuid().ToString("n"));
+            command.Parameters.AddWithValue("$id", record.ExecutionId ?? Guid.NewGuid().ToString("n"));
+            command.Parameters.AddWithValue("$turn_id", (object?)record.TurnId ?? DBNull.Value);
             command.Parameters.AddWithValue("$run_id", record.RunId);
             command.Parameters.AddWithValue("$session_id", record.SessionId);
             command.Parameters.AddWithValue("$tenant_id", (object?)record.TenantId ?? string.Empty);
@@ -516,6 +526,11 @@ public sealed class SqliteHarnessStateStore : ISkillSessionStore, IToolExecution
             command.Parameters.AddWithValue("$arguments_hash", record.ArgumentsHash);
             command.Parameters.AddWithValue("$result_hash", (object?)record.ResultHash ?? DBNull.Value);
             command.Parameters.AddWithValue("$success", record.Success ? 1 : 0);
+            command.Parameters.AddWithValue("$arguments_json", (object?)record.ArgumentsJson ?? DBNull.Value);
+            command.Parameters.AddWithValue("$result_json", (object?)record.ResultJson ?? DBNull.Value);
+            command.Parameters.AddWithValue("$structured_content_json", (object?)record.StructuredContentJson ?? DBNull.Value);
+            command.Parameters.AddWithValue("$is_error", record.IsError.HasValue ? record.IsError.Value ? 1 : 0 : DBNull.Value);
+            command.Parameters.AddWithValue("$status", record.Status);
             command.Parameters.AddWithValue("$error", (object?)record.Error ?? DBNull.Value);
             command.Parameters.AddWithValue("$authorization_decision", record.AuthorizationDecision);
             command.Parameters.AddWithValue("$started_at", record.StartedAt.ToString("O"));
@@ -582,6 +597,7 @@ public sealed class SqliteHarnessStateStore : ISkillSessionStore, IToolExecution
                 arguments_hash TEXT NOT NULL,
                 result_hash TEXT NULL,
                 success INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'Completed',
                 error TEXT NULL,
                 authorization_decision TEXT NOT NULL,
                 started_at TEXT NOT NULL,
@@ -650,6 +666,7 @@ public sealed class SqliteHarnessStateStore : ISkillSessionStore, IToolExecution
         EnsureColumn(connection, "goldfish_tool_executions", "result_json", "TEXT NULL");
         EnsureColumn(connection, "goldfish_tool_executions", "structured_content_json", "TEXT NULL");
         EnsureColumn(connection, "goldfish_tool_executions", "is_error", "INTEGER NULL");
+        EnsureColumn(connection, "goldfish_tool_executions", "status", "TEXT NOT NULL DEFAULT 'Completed'");
         using var indexes = connection.CreateCommand();
         indexes.CommandText = """
             CREATE UNIQUE INDEX IF NOT EXISTS ux_memory_messages_turn_sequence

@@ -1384,6 +1384,9 @@ JSON 格式：
             return authorizationRecord;
         }
 
+        await RecordToolIntentAsync(request, runId, step, functionCall.CallId,
+            toolFunction.Tool.Id, arguments, startedAt, ct);
+
         try
         {
             var result = await toolFunction.InvokeAsync(new AIFunctionArguments(functionCall.Arguments), ct);
@@ -1501,6 +1504,9 @@ JSON 格式：
             return authorizationRecord;
         }
 
+        await RecordToolIntentAsync(request, runId, step, toolCallId,
+            tool.Id, action.Arguments ?? "{}", startedAt, ct);
+
         var toolResult = await _toolRegistry.ExecuteAsync(action.Tool!, action.Arguments ?? "{}");
         var record = new ToolCallRecord
         {
@@ -1583,6 +1589,8 @@ JSON 格式：
         var context = GoldfishRunContext.FromAgentInfo(request.AgentInfo, request.SessionId, request.DisableConfigCache);
         await store.RecordAsync(new ToolExecutionRecord
         {
+            ExecutionId = ToolExecutionId(request, runId, step, record.ToolCallId, record.ToolId),
+            TurnId = request.TurnId,
             RunId = runId,
             SessionId = request.SessionId,
             TenantId = GetExtra(request.AgentInfo, "TenantId"),
@@ -1594,12 +1602,89 @@ JSON 格式：
             ToolId = record.ToolId,
             ArgumentsHash = ToolExecutionHash.Sha256(record.Arguments),
             ResultHash = string.IsNullOrWhiteSpace(record.Result) ? null : ToolExecutionHash.Sha256(record.Result),
+            ArgumentsJson = HarnessSensitiveData.Redact(record.Arguments),
+            ResultJson = HarnessSensitiveData.Redact(record.Result),
+            StructuredContentJson = ExtractStructuredContent(record.Result),
+            IsError = ExtractIsError(record.Result),
+            Status = record.Success ? "Completed" : "Failed",
             Success = record.Success,
             Error = error,
             AuthorizationDecision = authorizationDecision.ToString(),
             StartedAt = startedAt,
             CompletedAt = DateTimeOffset.UtcNow
         }, ct);
+    }
+
+    private static async Task RecordToolIntentAsync(
+        GoldfishHarnessRequest request,
+        string runId,
+        int step,
+        string? toolCallId,
+        string toolId,
+        string arguments,
+        DateTimeOffset startedAt,
+        CancellationToken ct)
+    {
+        var store = request.ToolExecutionStore ?? NullToolExecutionStore.Instance;
+        var context = GoldfishRunContext.FromAgentInfo(request.AgentInfo, request.SessionId, request.DisableConfigCache);
+        await store.RecordAsync(new ToolExecutionRecord
+        {
+            ExecutionId = ToolExecutionId(request, runId, step, toolCallId, toolId),
+            TurnId = request.TurnId,
+            RunId = runId,
+            SessionId = request.SessionId,
+            TenantId = GetExtra(request.AgentInfo, "TenantId"),
+            UserId = context.User.Id,
+            AgentId = context.Agent.Id,
+            WorkspaceId = GetExtra(request.AgentInfo, "WorkspaceId"),
+            Step = step,
+            ToolCallId = toolCallId,
+            ToolId = toolId,
+            ArgumentsHash = ToolExecutionHash.Sha256(arguments),
+            ArgumentsJson = HarnessSensitiveData.Redact(arguments),
+            Success = false,
+            Status = "Running",
+            AuthorizationDecision = ToolAuthorizationDecision.Allow.ToString(),
+            StartedAt = startedAt,
+            CompletedAt = startedAt
+        }, ct);
+    }
+
+    private static string ToolExecutionId(
+        GoldfishHarnessRequest request,
+        string runId,
+        int step,
+        string? toolCallId,
+        string toolId)
+        => ToolExecutionHash.Sha256($"{request.TurnId}\u001f{runId}\u001f{step}\u001f{toolCallId}\u001f{toolId}");
+
+    private static string? ExtractStructuredContent(string? result)
+    {
+        if (string.IsNullOrWhiteSpace(result)) return null;
+        try
+        {
+            using var document = JsonDocument.Parse(result);
+            return document.RootElement.ValueKind == JsonValueKind.Object
+                && document.RootElement.TryGetProperty("structuredContent", out var structured)
+                ? HarnessSensitiveData.Redact(structured.GetRawText())
+                : null;
+        }
+        catch (JsonException) { return null; }
+    }
+
+    private static bool? ExtractIsError(string? result)
+    {
+        if (string.IsNullOrWhiteSpace(result)) return null;
+        try
+        {
+            using var document = JsonDocument.Parse(result);
+            return document.RootElement.ValueKind == JsonValueKind.Object
+                && document.RootElement.TryGetProperty("isError", out var isError)
+                && isError.ValueKind is JsonValueKind.True or JsonValueKind.False
+                ? isError.GetBoolean()
+                : null;
+        }
+        catch (JsonException) { return null; }
     }
 
     private static string BuildLegacyToolCallId(int step, string toolId)
@@ -2062,7 +2147,8 @@ public sealed record GoldfishHarnessRequest(
     IToolAuthorizationHook? ToolAuthorizationHook = null,
     ReasoningOptions? ReasoningOptions = null,
     ReasoningStrategySelection? CachedReasoningSelection = null,
-    string? QueueKey = null);
+    string? QueueKey = null,
+    string? TurnId = null);
 
 public interface IGoldfishSteerSource
 {

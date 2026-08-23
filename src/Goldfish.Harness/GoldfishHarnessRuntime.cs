@@ -200,7 +200,7 @@ public sealed class GoldfishHarnessRuntime : IAsyncDisposable
         try
         {
             var context = await contextProvider.BuildAsync(session, active.Cancellation.Token);
-            var queuedRequest = context.Request with { QueueKey = turn.Partition.QueueKey };
+            var queuedRequest = context.Request with { QueueKey = turn.Partition.QueueKey, TurnId = turn.TurnId };
             var submission = _queue.Enqueue(queuedRequest, ExecuteDurably, turn.TurnId);
             await foreach (var ev in submission.Events.WithCancellation(active.Cancellation.Token))
                 await active.PublishAsync(ev, active.Cancellation.Token);

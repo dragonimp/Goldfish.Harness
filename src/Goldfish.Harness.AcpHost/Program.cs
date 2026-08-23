@@ -1,19 +1,23 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Goldfish.Harness;
 
-return await new AcpHost(Console.In, Console.Out, Console.Error).RunAsync();
+await using var host = new AcpHost(Console.In, Console.Out, Console.Error);
+return await host.RunAsync();
 
 public static class AcpHostAssembly;
 
-internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter error)
+internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter error) : IAsyncDisposable
 {
     private readonly ConcurrentDictionary<string, HostSession> _sessions = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, ActiveRun> _activeRuns = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, HostRuntimeScope> _runtimeScopes = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private readonly GoldfishAcpEventProjector _projector = new();
+    private readonly HarnessStateOptions _stateOptions = ReadHarnessStateOptions();
 
     public async Task<int> RunAsync()
     {
@@ -44,7 +48,11 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
                         case "initialize":
                             await WriteAsync(GoldfishAcpProtocol.Response(
                                 id,
-                                GoldfishAcpProtocol.InitializeResult("Goldfish.Harness", typeof(AcpHost).Assembly.GetName().Version?.ToString() ?? "1.0.0")));
+                                GoldfishAcpProtocol.InitializeResult(
+                                    "Goldfish.Harness",
+                                    typeof(AcpHost).Assembly.GetName().Version?.ToString() ?? "1.0.0",
+                                    SqliteHarnessStateStore.CurrentSchemaVersion,
+                                    _stateOptions.Mode.ToString())));
                             break;
                         case "session/new":
                             await CreateSessionAsync(id, request);
@@ -79,6 +87,13 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
         return 0;
     }
 
+    public async ValueTask DisposeAsync()
+    {
+        foreach (var run in _activeRuns.Values) run.Cancel();
+        foreach (var scope in _runtimeScopes.Values) await scope.DisposeAsync();
+        _writeLock.Dispose();
+    }
+
     private async Task CreateSessionAsync(JsonElement? id, JsonElement request)
     {
         var parameters = RequiredObject(request, "params");
@@ -88,7 +103,9 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
 
         var sessionId = ReadRequestedSessionId(parameters) ?? Guid.NewGuid().ToString("N");
         var runtime = ReadRuntime(parameters);
-        var session = new HostSession(sessionId, Path.GetFullPath(cwd), runtime);
+        var scope = _runtimeScopes.GetOrAdd(runtime.StateRoot,
+            root => new HostRuntimeScope(root, _stateOptions));
+        var session = new HostSession(sessionId, Path.GetFullPath(cwd), runtime, scope);
         if (!_sessions.TryAdd(sessionId, session))
             throw new InvalidOperationException($"ACP session already exists: {sessionId}");
 
@@ -114,14 +131,23 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
         }
 
         var prompt = ReadPrompt(parameters);
-        var promptContext = ReadPromptContext(parameters);
+        var promptMetadata = ReadPromptMetadata(parameters);
+        var turnId = string.IsNullOrWhiteSpace(promptMetadata.TurnId)
+            ? $"harness-{Guid.NewGuid():n}"
+            : promptMetadata.TurnId;
+        var requestId = string.IsNullOrWhiteSpace(promptMetadata.RequestId)
+            ? Guid.NewGuid().ToString("n")
+            : promptMetadata.RequestId;
+        run.BindRuntimeCancellation(() => session.Scope.Runtime.Cancel(turnId));
         _ = Task.Run(async () =>
         {
             Exception? failure = null;
             var stopReason = "end_turn";
             try
             {
-                await ExecutePromptAsync(session, prompt, promptContext, run.Token);
+                stopReason = await ExecutePromptAsync(session, prompt, promptMetadata,
+                    turnId, requestId, run.Token);
+                if (run.CancelRequested) stopReason = "cancelled";
             }
             catch (OperationCanceledException)
             {
@@ -129,8 +155,15 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
             }
             catch (Exception ex)
             {
-                failure = ex;
-                stopReason = "refusal";
+                if (run.CancelRequested)
+                {
+                    stopReason = "cancelled";
+                }
+                else
+                {
+                    failure = ex;
+                    stopReason = "refusal";
+                }
             }
             finally
             {
@@ -148,10 +181,12 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
         });
     }
 
-    private async Task ExecutePromptAsync(
+    private async Task<string> ExecutePromptAsync(
         HostSession session,
         string prompt,
-        IReadOnlyDictionary<string, string> promptContext,
+        HostPromptMetadata promptMetadata,
+        string turnId,
+        string requestId,
         CancellationToken ct)
     {
         var runtime = session.Runtime;
@@ -161,22 +196,9 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
             runtime.Model,
             runtime.Headers,
             runtime.MaxOutputTokens);
-        var tools = await HostToolRegistry.CreateAsync(session.Cwd, runtime.Context, runtime.McpServers, ct);
-        ISkillRegistry? skills = string.IsNullOrWhiteSpace(runtime.SkillsRoot)
-            ? null
-            : new FileSystemSkillRegistry(runtime.SkillsRoot);
+        var tools = await session.Scope.GetToolsAsync(session.Cwd, runtime, ct);
+        var skills = session.Scope.GetSkills(runtime.SkillsRoot);
         var runner = new GoldfishHarnessRunner(chatClient, tools, skillRegistry: skills);
-        var stateRoot = runtime.StateRoot;
-        Directory.CreateDirectory(stateRoot);
-        var history = new GoldfishSessionHistoryStore(Path.Combine(stateRoot, "sessions"));
-        var memoryOptions = MemoryOptions.Default;
-        var executor = new GoldfishHarnessSessionExecutor(
-            runner,
-            history,
-            new InMemoryMemoryManager(),
-            memoryOptions,
-            new GoldfishSessionQueue(),
-            turnEventStore: new JsonlHarnessTurnEventStore(stateRoot));
         var agentInfo = new AgentInfo
         {
             Id = runtime.AgentId,
@@ -186,26 +208,43 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
             SystemPrompt = runtime.SystemPrompt,
             // The AgentNode supplies a sanitized, runtime-scoped context.  Keep
             // it available to the Harness prompt builder as well as MCP tools.
-            ExtraData = MergeContext(runtime.Context, promptContext)
+            ExtraData = MergeContext(runtime.Context, promptMetadata.Context)
         };
+        var reasoningOptions = new ReasoningOptions
+        {
+            Strategy = promptMetadata.Strategy ?? ReasoningStrategyKind.ReAct
+        };
+        var partition = runtime.MemoryPartition with { SessionId = session.SessionId };
         var request = new GoldfishHarnessSessionRequest(
             agentInfo,
             session.SessionId,
             prompt,
-            runtime.MemoryPartition with { SessionId = session.SessionId },
+            partition,
             MaxOutputTokens: runtime.MaxOutputTokens ?? 2048,
-            Temperature: runtime.Temperature);
+            Temperature: runtime.Temperature,
+            SkillSessionStore: session.Scope.StateStore,
+            ToolExecutionStore: session.Scope.StateStore,
+            ReasoningOptions: reasoningOptions);
 
-        var answer = new StringBuilder();
-        await foreach (var ev in executor.StreamAsync(request, ct).WithCancellation(ct))
+        var context = new DefaultHarnessContextProvider(new GoldfishHarnessContextAssembler(
+            session.Scope.History,
+            session.Scope.Memory,
+            session.Scope.MemoryOptions));
+        var terminal = GoldfishTurnStatus.Failed;
+        await foreach (var ev in session.Scope.Runtime.ExecuteAsync(
+            new GoldfishHarnessTurnRequest(request, turnId, requestId,
+                promptMetadata.RetryOfTurnId, promptMetadata.Source),
+            context,
+            new GoldfishRunnerExecutionStrategy(runner),
+            ct).WithCancellation(ct))
         {
-            if (ev.Kind == GoldfishEventKind.TextDelta) answer.Append(ev.Delta);
+            if (ev.Kind == GoldfishEventKind.Completed) terminal = GoldfishTurnStatus.Completed;
+            else if (ev.Kind == GoldfishEventKind.Failed) terminal = GoldfishTurnStatus.Failed;
             foreach (var frame in _projector.Project(session.SessionId, ev))
                 await WriteAsync(frame);
         }
-
-        if (answer.Length > 0)
-            await executor.PersistTurnAsync(request, answer.ToString(), ct);
+        ct.ThrowIfCancellationRequested();
+        return terminal == GoldfishTurnStatus.Completed ? "end_turn" : "refusal";
     }
 
     private async Task CancelSessionAsync(JsonElement? id, JsonElement request)
@@ -233,7 +272,13 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
             await run.Completion.Task;
         }
 
-        var reset = _sessions.TryRemove(sessionId, out _);
+        var reset = _sessions.TryRemove(sessionId, out var session);
+        if (reset && session is not null)
+        {
+            var partition = session.Runtime.MemoryPartition with { SessionId = sessionId };
+            await session.Scope.Runtime.ResetSessionAsync(partition);
+            await session.Scope.History.ResetAsync(sessionId);
+        }
         await WriteAsync(GoldfishAcpProtocol.Response(id, new { reset, sessionId }));
     }
 
@@ -242,15 +287,32 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
         private readonly object _gate = new();
         private readonly CancellationTokenSource _cancellation = new();
         private bool _disposed;
+        private int _cancelRequested;
+        private Action? _cancelRuntime;
 
         public CancellationToken Token => _cancellation.Token;
+        public bool CancelRequested => Volatile.Read(ref _cancelRequested) != 0;
         public TaskCompletionSource Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public void Cancel()
         {
             lock (_gate)
             {
-                if (!_disposed) _cancellation.Cancel();
+                if (!_disposed)
+                {
+                    Volatile.Write(ref _cancelRequested, 1);
+                    _cancelRuntime?.Invoke();
+                    _cancellation.Cancel();
+                }
+            }
+        }
+
+        public void BindRuntimeCancellation(Action cancelRuntime)
+        {
+            lock (_gate)
+            {
+                if (_disposed) return;
+                _cancelRuntime = cancelRuntime;
             }
         }
 
@@ -354,13 +416,52 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
         return text.ToString();
     }
 
-    private static IReadOnlyDictionary<string, string> ReadPromptContext(JsonElement parameters)
+    private static HostPromptMetadata ReadPromptMetadata(JsonElement parameters)
     {
         if (!parameters.TryGetProperty("_meta", out var meta) || meta.ValueKind != JsonValueKind.Object
             || !meta.TryGetProperty("agentfree", out var agentfree) || agentfree.ValueKind != JsonValueKind.Object)
-            return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        return ReadStringMap(agentfree, "context");
+            return new HostPromptMetadata(null, null, null, "local", null,
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase));
+        ReasoningStrategyKind? strategy = null;
+        if (agentfree.TryGetProperty("reasoning", out var reasoning) && reasoning.ValueKind == JsonValueKind.Object)
+            strategy = ParseStrategy(ReadString(reasoning, "strategy"));
+        strategy ??= ParseStrategy(ReadString(agentfree, "reasoningStrategy"));
+        return new HostPromptMetadata(
+            ReadString(agentfree, "turnId"),
+            ReadString(agentfree, "requestId"),
+            ReadString(agentfree, "retryOfTurnId"),
+            ReadString(agentfree, "source") ?? "local",
+            strategy,
+            ReadStringMap(agentfree, "context"));
     }
+
+    private static ReasoningStrategyKind? ParseStrategy(string? value) => value?.Trim().ToLowerInvariant() switch
+    {
+        "react" or "re-act" => ReasoningStrategyKind.ReAct,
+        "auto" => ReasoningStrategyKind.Auto,
+        "plan" or "planandexecute" or "plan-and-execute" => ReasoningStrategyKind.PlanAndExecute,
+        "rewoo" or "re-woo" => ReasoningStrategyKind.ReWOO,
+        _ => null
+    };
+
+    private static HarnessStateOptions ReadHarnessStateOptions()
+    {
+        var modeText = Environment.GetEnvironmentVariable("HarnessState__Mode");
+        var mode = Enum.TryParse<HarnessStateMode>(modeText, true, out var parsedMode)
+            ? parsedMode
+            : HarnessStateMode.Dual;
+        return new HarnessStateOptions
+        {
+            Mode = mode,
+            RetentionDays = ReadPositiveEnvironmentInt("HarnessState__RetentionDays", 30),
+            DeltaBatchMilliseconds = ReadPositiveEnvironmentInt("HarnessState__DeltaBatchMilliseconds", 50),
+            DeltaBatchBytes = ReadPositiveEnvironmentInt("HarnessState__DeltaBatchBytes", 4096),
+            LeaseSeconds = ReadPositiveEnvironmentInt("HarnessState__LeaseSeconds", 30)
+        };
+    }
+
+    private static int ReadPositiveEnvironmentInt(string name, int fallback)
+        => int.TryParse(Environment.GetEnvironmentVariable(name), out var value) && value > 0 ? value : fallback;
 
     private static Dictionary<string, string> MergeContext(
         IReadOnlyDictionary<string, string> runtimeContext,
@@ -431,7 +532,89 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
     }
 }
 
-internal sealed record HostSession(string SessionId, string Cwd, HostRuntime Runtime);
+internal sealed record HostSession(string SessionId, string Cwd, HostRuntime Runtime, HostRuntimeScope Scope);
+
+internal sealed record HostPromptMetadata(
+    string? TurnId,
+    string? RequestId,
+    string? RetryOfTurnId,
+    string Source,
+    ReasoningStrategyKind? Strategy,
+    IReadOnlyDictionary<string, string> Context);
+
+internal sealed class HostRuntimeScope : IAsyncDisposable
+{
+    private readonly ConcurrentDictionary<string, Task<IToolRegistry>> _toolRegistries = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, ISkillRegistry> _skillRegistries = new(StringComparer.Ordinal);
+    private readonly IHarnessRuntimeStore _runtimeStore;
+
+    public HostRuntimeScope(string stateRoot, HarnessStateOptions options)
+    {
+        Directory.CreateDirectory(stateRoot);
+        StateStore = new SqliteHarnessStateStore(Path.Combine(stateRoot, "harness-state.db"), options);
+        if (options.Mode == HarnessStateMode.Dual)
+        {
+            JsonlHarnessImporter.ImportAsync(
+                Path.Combine(stateRoot, "turn-events.jsonl"),
+                StateStore,
+                DateTimeOffset.UtcNow.AddDays(-Math.Max(1, options.RetentionDays)))
+                .GetAwaiter().GetResult();
+        }
+        _runtimeStore = options.Mode switch
+        {
+            HarnessStateMode.Jsonl => new JsonlHarnessRuntimeStore(stateRoot),
+            HarnessStateMode.Dual => new DualHarnessRuntimeStore(StateStore, new JsonlHarnessTurnEventStore(stateRoot)),
+            _ => StateStore
+        };
+        Runtime = new GoldfishHarnessRuntime(_runtimeStore, options: options);
+        MemoryOptions = MemoryOptions.Default;
+        MemoryOptions.Sqlite.Enabled = true;
+        MemoryOptions.Sqlite.DatabasePath = Path.Combine(stateRoot, "harness-state.db");
+        Memory = new SqliteMemoryManager(MemoryOptions.Sqlite);
+        History = new GoldfishSessionHistoryStore(Path.Combine(stateRoot, "sessions"));
+    }
+
+    public SqliteHarnessStateStore StateStore { get; }
+    public GoldfishHarnessRuntime Runtime { get; }
+    public SqliteMemoryManager Memory { get; }
+    public MemoryOptions MemoryOptions { get; }
+    public GoldfishSessionHistoryStore History { get; }
+
+    public async Task<IToolRegistry> GetToolsAsync(string workspace, HostRuntime runtime, CancellationToken ct)
+    {
+        var fingerprintSource = JsonSerializer.Serialize(new
+        {
+            workspace = Path.GetFullPath(workspace),
+            runtime.AgentId,
+            runtime.Context,
+            runtime.McpServers
+        });
+        var key = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(fingerprintSource)));
+        var task = _toolRegistries.GetOrAdd(key,
+            _ => HostToolRegistry.CreateAsync(workspace, runtime.Context, runtime.McpServers, CancellationToken.None));
+        try
+        {
+            return await task.WaitAsync(ct);
+        }
+        catch
+        {
+            _toolRegistries.TryRemove(new KeyValuePair<string, Task<IToolRegistry>>(key, task));
+            throw;
+        }
+    }
+
+    public ISkillRegistry? GetSkills(string? skillsRoot)
+        => string.IsNullOrWhiteSpace(skillsRoot)
+            ? null
+            : _skillRegistries.GetOrAdd(Path.GetFullPath(skillsRoot), root => new FileSystemSkillRegistry(root));
+
+    public async ValueTask DisposeAsync()
+    {
+        await Runtime.DisposeAsync();
+        if (_runtimeStore is IDisposable disposable) disposable.Dispose();
+        StateStore.Dispose();
+    }
+}
 
 internal sealed record HostRuntime(
     string AgentType,

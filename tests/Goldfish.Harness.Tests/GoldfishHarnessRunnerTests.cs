@@ -914,6 +914,10 @@ public sealed class GoldfishHarnessRunnerTests
                 ToolId = "tool",
                 ArgumentsHash = ToolExecutionHash.Sha256("""{"secret":"value"}"""),
                 ResultHash = ToolExecutionHash.Sha256("result"),
+                ArgumentsJson = HarnessSensitiveData.Redact("""{"apiKey":"must-not-persist","query":"value"}"""),
+                ResultJson = """{"structuredContent":{"value":1},"isError":false}""",
+                StructuredContentJson = """{"value":1}""",
+                IsError = false,
                 Success = true,
                 AuthorizationDecision = ToolAuthorizationDecision.Allow.ToString()
             });
@@ -928,11 +932,15 @@ public sealed class GoldfishHarnessRunnerTests
         await using var connection = new SqliteConnection($"Data Source={databasePath}");
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT arguments_hash, result_hash FROM goldfish_tool_executions WHERE tool_id = 'tool'";
+        command.CommandText = "SELECT arguments_hash, result_hash, arguments_json, structured_content_json, is_error FROM goldfish_tool_executions WHERE tool_id = 'tool'";
         await using var reader = await command.ExecuteReaderAsync();
         Assert.True(await reader.ReadAsync());
         Assert.Equal(ToolExecutionHash.Sha256("""{"secret":"value"}"""), reader.GetString(0));
         Assert.Equal(ToolExecutionHash.Sha256("result"), reader.GetString(1));
+        Assert.DoesNotContain("must-not-persist", reader.GetString(2));
+        Assert.Contains("[REDACTED]", reader.GetString(2));
+        Assert.Equal("""{"value":1}""", reader.GetString(3));
+        Assert.Equal(0, reader.GetInt32(4));
     }
 
     private static object CreateLegacyToolAction(string toolId, string arguments)

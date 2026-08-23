@@ -75,6 +75,31 @@ public sealed class SqliteHarnessRuntimeStoreTests
         Assert.Equal(0L, Convert.ToInt64(await command.ExecuteScalarAsync(TestContext.Current.CancellationToken)));
     }
 
+    [Fact]
+    public async Task ImportsLegacyJsonlIdempotently()
+    {
+        var root = NewRoot();
+        var legacy = new JsonlHarnessTurnEventStore(root);
+        var turn = NewTurn("legacy-request") with { TurnId = "legacy-turn" };
+        await legacy.StartAsync(turn, TestContext.Current.CancellationToken);
+        await legacy.AppendAsync(new GoldfishHarnessTurnEvent(turn.TurnId, turn.SessionId,
+            GoldfishHarnessEvent.Text(1, "legacy text")), TestContext.Current.CancellationToken);
+        await legacy.CompleteAsync(turn.TurnId, GoldfishTurnStatus.Completed, "end_turn",
+            TestContext.Current.CancellationToken);
+
+        using var store = new SqliteHarnessStateStore(Path.Combine(root, "harness-state.db"));
+        var first = await JsonlHarnessImporter.ImportAsync(Path.Combine(root, "turn-events.jsonl"), store,
+            DateTimeOffset.UtcNow.AddDays(-1), TestContext.Current.CancellationToken);
+        var second = await JsonlHarnessImporter.ImportAsync(Path.Combine(root, "turn-events.jsonl"), store,
+            DateTimeOffset.UtcNow.AddDays(-1), TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, first.ImportedTurns);
+        Assert.Equal(1, first.ImportedEvents);
+        Assert.Equal(1, second.SkippedLines);
+        Assert.Equal(GoldfishTurnStatus.Completed,
+            (await store.GetTurnAsync(turn.TurnId, TestContext.Current.CancellationToken))!.Status);
+    }
+
     private static GoldfishHarnessTurn NewTurn(string requestId) => new()
     {
         TurnId = $"turn-{requestId}",

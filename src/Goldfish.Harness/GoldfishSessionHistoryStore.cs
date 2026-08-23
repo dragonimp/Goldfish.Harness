@@ -63,6 +63,14 @@ public sealed class GoldfishSessionHistoryStore
     public void ClearReasoningSelection(string sessionId)
         => _reasoningSelections.TryRemove(NormalizeSessionId(sessionId), out _);
 
+    public Task ResetAsync(string sessionId)
+    {
+        ClearReasoningSelection(sessionId);
+        var path = GetPath(sessionId);
+        if (File.Exists(path)) File.Delete(path);
+        return Task.CompletedTask;
+    }
+
     private string GetPath(string sessionId)
     {
         var safe = NormalizeSessionId(sessionId);

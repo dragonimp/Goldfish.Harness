@@ -14,7 +14,11 @@ public static class GoldfishAcpProtocol
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
-    public static object InitializeResult(string name, string version) => new
+    public static object InitializeResult(
+        string name,
+        string version,
+        int? schemaVersion = null,
+        string? stateMode = null) => new
     {
         protocolVersion = Version,
         agentCapabilities = new
@@ -31,7 +35,13 @@ public static class GoldfishAcpProtocol
             agentfree = new
             {
                 runtime = "goldfish-harness",
-                nativeEvents = false
+                nativeEvents = false,
+                goldfish = new
+                {
+                    kernelVersion = version,
+                    schemaVersion,
+                    stateMode
+                }
             }
         }
     };

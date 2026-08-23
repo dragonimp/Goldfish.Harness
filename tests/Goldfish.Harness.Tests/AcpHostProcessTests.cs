@@ -3,6 +3,8 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
+using Goldfish.Harness;
+using Microsoft.Data.Sqlite;
 using Xunit;
 
 namespace Goldfish.Harness.Tests;
@@ -24,6 +26,9 @@ public sealed class AcpHostProcessTests
             await SendAsync(process, new { jsonrpc = "2.0", id = 1, method = "initialize", @params = new { } });
             var initialize = await ReadUntilResponseAsync(process, 1, timeout.Token);
             Assert.Equal(1, initialize.GetProperty("result").GetProperty("protocolVersion").GetInt32());
+            var goldfish = initialize.GetProperty("result").GetProperty("_meta").GetProperty("agentfree").GetProperty("goldfish");
+            Assert.Equal(SqliteHarnessStateStore.CurrentSchemaVersion, goldfish.GetProperty("schemaVersion").GetInt32());
+            Assert.Equal("Dual", goldfish.GetProperty("stateMode").GetString());
 
             await SendAsync(process, new
             {
@@ -61,7 +66,17 @@ public sealed class AcpHostProcessTests
                 @params = new
                 {
                     sessionId = "process-session",
-                    prompt = new[] { new { type = "text", text = "hello" } }
+                    prompt = new[] { new { type = "text", text = "hello" } },
+                    _meta = new
+                    {
+                        agentfree = new
+                        {
+                            turnId = "gateway-turn-1",
+                            requestId = "gateway-request-1",
+                            source = "gateway",
+                            reasoning = new { strategy = "react" }
+                        }
+                    }
                 }
             });
 
@@ -72,6 +87,37 @@ public sealed class AcpHostProcessTests
             Assert.Equal(
                 "hello from independent harness",
                 message.GetProperty("params").GetProperty("update").GetProperty("content").GetProperty("text").GetString());
+
+            var requestCount = server.RequestCount;
+            await SendAsync(process, new
+            {
+                jsonrpc = "2.0",
+                id = 5,
+                method = "session/prompt",
+                @params = new
+                {
+                    sessionId = "process-session",
+                    prompt = "hello",
+                    _meta = new { agentfree = new { turnId = "ignored-duplicate", requestId = "gateway-request-1" } }
+                }
+            });
+            var replay = await ReadUntilResponseWithFramesAsync(process, 5, timeout.Token);
+            Assert.Equal("end_turn", replay.Response.GetProperty("result").GetProperty("stopReason").GetString());
+            Assert.Equal(requestCount, server.RequestCount);
+
+            await using (var connection = new SqliteConnection($"Data Source={Path.Combine(state.FullName, "harness-state.db")}"))
+            {
+                await connection.OpenAsync(timeout.Token);
+                await using var command = connection.CreateCommand();
+                command.CommandText = "SELECT turn_id, request_id, status, strategy FROM goldfish_turns;";
+                await using var reader = await command.ExecuteReaderAsync(timeout.Token);
+                Assert.True(await reader.ReadAsync(timeout.Token));
+                Assert.Equal("gateway-turn-1", reader.GetString(0));
+                Assert.Equal("gateway-request-1", reader.GetString(1));
+                Assert.Equal("Completed", reader.GetString(2));
+                Assert.Equal("ReAct", reader.GetString(3));
+                Assert.False(await reader.ReadAsync(timeout.Token));
+            }
 
             await SendAsync(process, new { jsonrpc = "2.0", id = 4, method = "shutdown", @params = new { } });
             await ReadUntilResponseAsync(process, 4, timeout.Token);

@@ -52,6 +52,17 @@ ln -sfn "$RELEASE_DIR" "$CURRENT_LINK"
 # deployments preserve the same key in their generated plist.
 /usr/libexec/PlistBuddy -c "Delete :EnvironmentVariables:GoldfishHarnessAcp__Command" "$NODE_PLIST" >/dev/null 2>&1 || true
 /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:GoldfishHarnessAcp__Command string $CURRENT_LINK/Goldfish.Harness.AcpHost" "$NODE_PLIST"
+for state_setting in \
+  "HarnessState__Mode:Dual" \
+  "HarnessState__RetentionDays:30" \
+  "HarnessState__DeltaBatchMilliseconds:50" \
+  "HarnessState__DeltaBatchBytes:4096" \
+  "HarnessState__LeaseSeconds:30"; do
+  state_key="${state_setting%%:*}"
+  state_value="${state_setting#*:}"
+  /usr/libexec/PlistBuddy -c "Delete :EnvironmentVariables:$state_key" "$NODE_PLIST" >/dev/null 2>&1 || true
+  /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:$state_key string $state_value" "$NODE_PLIST"
+done
 
 # launchd keeps EnvironmentVariables in its loaded job definition. Reload the
 # existing service so the new command path is read; no AgentNode files change.

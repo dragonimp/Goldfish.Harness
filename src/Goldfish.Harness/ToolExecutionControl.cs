@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace Goldfish.Harness;
 
@@ -69,6 +70,8 @@ public sealed class AllowAllToolAuthorizationHook : IToolAuthorizationHook
 
 public sealed record ToolExecutionRecord
 {
+    public string? ExecutionId { get; init; }
+    public string? TurnId { get; init; }
     public string RunId { get; init; } = string.Empty;
     public string SessionId { get; init; } = string.Empty;
     public string? TenantId { get; init; }
@@ -80,11 +83,32 @@ public sealed record ToolExecutionRecord
     public string ToolId { get; init; } = string.Empty;
     public string ArgumentsHash { get; init; } = string.Empty;
     public string? ResultHash { get; init; }
+    public string? ArgumentsJson { get; init; }
+    public string? ResultJson { get; init; }
+    public string? StructuredContentJson { get; init; }
+    public bool? IsError { get; init; }
+    public string Status { get; init; } = "Completed";
     public bool Success { get; init; }
     public string? Error { get; init; }
     public string AuthorizationDecision { get; init; } = ToolAuthorizationDecision.Allow.ToString();
     public DateTimeOffset StartedAt { get; init; } = DateTimeOffset.UtcNow;
     public DateTimeOffset CompletedAt { get; init; } = DateTimeOffset.UtcNow;
+}
+
+public static partial class HarnessSensitiveData
+{
+    [GeneratedRegex("(?i)(\\\"(?:api[_-]?key|authorization|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|authorization[_-]?code)\\\"\\s*:\\s*\\\")[^\\\"]*(\\\")")]
+    private static partial Regex JsonSecretRegex();
+
+    [GeneratedRegex("(?i)Bearer\\s+[A-Za-z0-9._~+\\-/]+=*")]
+    private static partial Regex BearerRegex();
+
+    public static string? Redact(string? value)
+    {
+        if (string.IsNullOrEmpty(value)) return value;
+        var redacted = JsonSecretRegex().Replace(value, "$1[REDACTED]$2");
+        return BearerRegex().Replace(redacted, "Bearer [REDACTED]");
+    }
 }
 
 public interface IToolExecutionStore
@@ -124,7 +148,11 @@ public sealed class InMemoryToolExecutionStore : IToolExecutionStore
     {
         lock (_lock)
         {
-            _records.Add(record);
+            var existing = string.IsNullOrWhiteSpace(record.ExecutionId)
+                ? -1
+                : _records.FindIndex(item => string.Equals(item.ExecutionId, record.ExecutionId, StringComparison.Ordinal));
+            if (existing >= 0) _records[existing] = record;
+            else _records.Add(record);
         }
 
         return Task.CompletedTask;
