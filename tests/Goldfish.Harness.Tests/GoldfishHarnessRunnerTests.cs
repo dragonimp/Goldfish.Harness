@@ -853,6 +853,7 @@ public sealed class GoldfishHarnessRunnerTests
         var auditRecord = Assert.Single(audit.Records);
         Assert.Equal("Deny", auditRecord.AuthorizationDecision);
         Assert.Equal("recording.tool", auditRecord.ToolId);
+        Assert.True(auditRecord.IsError);
         Assert.False(string.IsNullOrWhiteSpace(auditRecord.ArgumentsHash));
     }
 

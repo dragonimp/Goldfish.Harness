@@ -1605,7 +1605,9 @@ JSON 格式：
             ArgumentsJson = HarnessSensitiveData.Redact(record.Arguments),
             ResultJson = HarnessSensitiveData.Redact(record.Result),
             StructuredContentJson = ExtractStructuredContent(record.Result),
-            IsError = ExtractIsError(record.Result),
+            // MCP `isError` is optional and absence means a successful CallToolResult.
+            // Persist an explicit boolean so audit readers do not have to infer it.
+            IsError = ExtractIsError(record.Result) ?? !record.Success,
             Status = record.Success ? "Completed" : "Failed",
             Success = record.Success,
             Error = error,
