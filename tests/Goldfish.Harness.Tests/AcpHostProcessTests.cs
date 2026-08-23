@@ -26,7 +26,7 @@ public sealed class AcpHostProcessTests
             await SendAsync(process, new { jsonrpc = "2.0", id = 1, method = "initialize", @params = new { } });
             var initialize = await ReadUntilResponseAsync(process, 1, timeout.Token);
             Assert.Equal(1, initialize.GetProperty("result").GetProperty("protocolVersion").GetInt32());
-            var goldfish = initialize.GetProperty("result").GetProperty("_meta").GetProperty("agentfree").GetProperty("goldfish");
+            var goldfish = initialize.GetProperty("result").GetProperty("_meta").GetProperty("goldfish");
             Assert.Equal(SqliteHarnessStateStore.CurrentSchemaVersion, goldfish.GetProperty("schemaVersion").GetInt32());
             Assert.Equal("Dual", goldfish.GetProperty("stateMode").GetString());
 

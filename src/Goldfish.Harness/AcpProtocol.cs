@@ -32,6 +32,12 @@ public static class GoldfishAcpProtocol
         agentInfo = new { name, version },
         _meta = new
         {
+            goldfish = new
+            {
+                kernelVersion = version,
+                schemaVersion,
+                stateMode
+            },
             agentfree = new
             {
                 runtime = "goldfish-harness",
