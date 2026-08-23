@@ -560,6 +560,7 @@ public sealed class SqliteHarnessStateStore : ISkillSessionStore, IToolExecution
             DefaultTimeout = 30
         }.ToString());
         connection.Open();
+        RestrictPermissions();
         return connection;
     }
 
@@ -860,8 +861,11 @@ public sealed class SqliteHarnessStateStore : ISkillSessionStore, IToolExecution
         var directory = Path.GetDirectoryName(_databasePath);
         if (!string.IsNullOrEmpty(directory)) File.SetUnixFileMode(directory,
             UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
-        if (File.Exists(_databasePath)) File.SetUnixFileMode(_databasePath,
-            UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        foreach (var path in new[] { _databasePath, _databasePath + "-wal", _databasePath + "-shm" })
+        {
+            if (File.Exists(path)) File.SetUnixFileMode(path,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
     }
 
     private static void AddSkillKeyParameters(SqliteCommand command, SkillSessionKey key)

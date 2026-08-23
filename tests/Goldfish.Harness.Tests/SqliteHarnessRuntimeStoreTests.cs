@@ -7,6 +7,26 @@ namespace Goldfish.Harness.Tests;
 public sealed class SqliteHarnessRuntimeStoreTests
 {
     [Fact]
+    public async Task Store_RestrictsDatabaseAndWalSidecarPermissions()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        var root = NewRoot();
+        var database = Path.Combine(root, "harness-state.db");
+        using var store = new SqliteHarnessStateStore(database);
+        var turn = NewTurn("permissions");
+
+        await store.GetOrCreateTurnAsync(turn, "hello", TestContext.Current.CancellationToken);
+        await store.TryStartAsync(turn.TurnId, "test", DateTimeOffset.UtcNow.AddMinutes(1), TestContext.Current.CancellationToken);
+        await store.AppendEventsAsync(turn.TurnId, turn.SessionId,
+            [GoldfishHarnessEvent.Text(1, "running")], TestContext.Current.CancellationToken);
+
+        var expected = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        Assert.Equal(expected, File.GetUnixFileMode(database));
+        Assert.Equal(expected, File.GetUnixFileMode(database + "-wal"));
+        Assert.Equal(expected, File.GetUnixFileMode(database + "-shm"));
+    }
+
+    [Fact]
     public async Task PersistsTurnEventsAndFirstTerminalStateAcrossRestart()
     {
         var root = NewRoot();
