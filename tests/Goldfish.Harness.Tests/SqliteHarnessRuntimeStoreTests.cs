@@ -27,6 +27,36 @@ public sealed class SqliteHarnessRuntimeStoreTests
     }
 
     [Fact]
+    public async Task Store_PersistsEffectiveStrategyAndUsageTelemetry()
+    {
+        var root = NewRoot();
+        using var store = new SqliteHarnessStateStore(Path.Combine(root, "harness-state.db"));
+        var turn = NewTurn("telemetry") with { Strategy = ReasoningStrategyKind.Auto.ToString() };
+        await store.GetOrCreateTurnAsync(turn, "classify this", TestContext.Current.CancellationToken);
+        await store.AppendEventsAsync(turn.TurnId, turn.SessionId,
+        [
+            GoldfishHarnessEvent.ReasoningStrategySelected(new ReasoningStrategySelection(
+                ReasoningStrategyKind.Auto, ReasoningStrategyKind.ReWOO, false, "classifier")),
+            GoldfishHarnessEvent.TokenUsage(1, new Microsoft.Extensions.AI.UsageDetails
+            {
+                InputTokenCount = 11,
+                OutputTokenCount = 7,
+                TotalTokenCount = 18
+            })
+        ], TestContext.Current.CancellationToken);
+
+        var persisted = await store.GetTurnAsync(turn.TurnId, TestContext.Current.CancellationToken);
+        Assert.NotNull(persisted);
+        Assert.Equal("Auto", persisted.Strategy);
+        Assert.Equal("ReWOO", persisted.EffectiveStrategy);
+        Assert.Equal("classifier", persisted.StrategyReason);
+        Assert.Equal(11, persisted.InputTokens);
+        Assert.Equal(7, persisted.OutputTokens);
+        Assert.Equal(18, persisted.TotalTokens);
+        Assert.Equal(3, store.SchemaVersion);
+    }
+
+    [Fact]
     public async Task PersistsTurnEventsAndFirstTerminalStateAcrossRestart()
     {
         var root = NewRoot();

@@ -8,7 +8,7 @@ namespace Goldfish.Harness;
 
 public sealed class SqliteHarnessStateStore : ISkillSessionStore, IToolExecutionStore, IHarnessRuntimeStore, IDisposable
 {
-    public const int CurrentSchemaVersion = 2;
+    public const int CurrentSchemaVersion = 3;
     private readonly string _databasePath;
     private readonly HarnessStateOptions _options;
     private readonly SemaphoreSlim _writerLock = new(1, 1);
@@ -131,6 +131,7 @@ public sealed class SqliteHarnessStateStore : ISkillSessionStore, IToolExecution
             var sequence = await NextSequenceAsync(connection, transaction, turnId, ct);
             foreach (var ev in events)
                 await InsertEventAsync(connection, transaction, turnId, sessionId, sequence++, ev, ct);
+            await UpdateTurnTelemetryAsync(connection, transaction, turnId, events, ct);
             await transaction.CommitAsync(ct);
         }
         finally
@@ -622,7 +623,12 @@ public sealed class SqliteHarnessStateStore : ISkillSessionStore, IToolExecution
                 turn_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, run_id TEXT NOT NULL DEFAULT '',
                 tenant_id TEXT NOT NULL DEFAULT '', user_id TEXT NOT NULL DEFAULT '',
                 agent_id TEXT NOT NULL DEFAULT '', workspace_id TEXT NOT NULL DEFAULT '',
-                session_id TEXT NOT NULL, strategy TEXT NOT NULL, retry_of_turn_id TEXT NULL,
+                session_id TEXT NOT NULL, strategy TEXT NOT NULL,
+                effective_strategy TEXT NULL, strategy_reason TEXT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                retry_of_turn_id TEXT NULL,
                 status TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
                 started_at TEXT NULL, completed_at TEXT NULL, heartbeat_at TEXT NULL,
                 lease_owner TEXT NULL, lease_expires_at TEXT NULL,
@@ -656,7 +662,7 @@ public sealed class SqliteHarnessStateStore : ISkillSessionStore, IToolExecution
             CREATE INDEX IF NOT EXISTS ix_goldfish_turn_events_turn_sequence
             ON goldfish_turn_events(turn_id, sequence);
 
-            PRAGMA user_version = 2;
+            PRAGMA user_version = 3;
             """;
         command.ExecuteNonQuery();
 
@@ -668,6 +674,11 @@ public sealed class SqliteHarnessStateStore : ISkillSessionStore, IToolExecution
         EnsureColumn(connection, "goldfish_tool_executions", "structured_content_json", "TEXT NULL");
         EnsureColumn(connection, "goldfish_tool_executions", "is_error", "INTEGER NULL");
         EnsureColumn(connection, "goldfish_tool_executions", "status", "TEXT NOT NULL DEFAULT 'Completed'");
+        EnsureColumn(connection, "goldfish_turns", "effective_strategy", "TEXT NULL");
+        EnsureColumn(connection, "goldfish_turns", "strategy_reason", "TEXT NULL");
+        EnsureColumn(connection, "goldfish_turns", "input_tokens", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumn(connection, "goldfish_turns", "output_tokens", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumn(connection, "goldfish_turns", "total_tokens", "INTEGER NOT NULL DEFAULT 0");
         using var indexes = connection.CreateCommand();
         indexes.CommandText = """
             CREATE UNIQUE INDEX IF NOT EXISTS ux_memory_messages_turn_sequence
@@ -719,7 +730,8 @@ public sealed class SqliteHarnessStateStore : ISkillSessionStore, IToolExecution
             SELECT turn_id, request_id, run_id, tenant_id, user_id, agent_id, workspace_id,
                    session_id, strategy, retry_of_turn_id, status, version, created_at,
                    started_at, completed_at, heartbeat_at, lease_owner, lease_expires_at,
-                   terminal_reason_code, terminal_reason
+                   terminal_reason_code, terminal_reason, effective_strategy, strategy_reason,
+                   input_tokens, output_tokens, total_tokens
             FROM goldfish_turns
             """;
         return command;
@@ -750,7 +762,10 @@ public sealed class SqliteHarnessStateStore : ISkillSessionStore, IToolExecution
         StartedAt = ParseNullableDate(reader, 13), CompletedAt = ParseNullableDate(reader, 14),
         HeartbeatAt = ParseNullableDate(reader, 15), LeaseOwner = reader.IsDBNull(16) ? null : reader.GetString(16),
         LeaseExpiresAt = ParseNullableDate(reader, 17), TerminalReasonCode = reader.IsDBNull(18) ? null : reader.GetString(18),
-        TerminalReason = reader.IsDBNull(19) ? null : reader.GetString(19)
+        TerminalReason = reader.IsDBNull(19) ? null : reader.GetString(19),
+        EffectiveStrategy = reader.IsDBNull(20) ? null : reader.GetString(20),
+        StrategyReason = reader.IsDBNull(21) ? null : reader.GetString(21),
+        InputTokens = reader.GetInt64(22), OutputTokens = reader.GetInt64(23), TotalTokens = reader.GetInt64(24)
     };
 
     private static DateTimeOffset? ParseNullableDate(SqliteDataReader reader, int ordinal)
@@ -763,6 +778,37 @@ public sealed class SqliteHarnessStateStore : ISkillSessionStore, IToolExecution
         command.CommandText = "SELECT COALESCE(MAX(sequence), 0) + 1 FROM goldfish_turn_events WHERE turn_id = $turn_id;";
         command.Parameters.AddWithValue("$turn_id", turnId);
         return Convert.ToInt64(await command.ExecuteScalarAsync(ct));
+    }
+
+    private static async Task UpdateTurnTelemetryAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string turnId,
+        IReadOnlyList<GoldfishHarnessEvent> events,
+        CancellationToken ct)
+    {
+        var selection = events.LastOrDefault(ev => ev.ReasoningSelection is not null)?.ReasoningSelection;
+        var usages = events.Where(ev => ev.Usage is not null).Select(ev => ev.Usage!).ToArray();
+        if (selection is null && usages.Length == 0) return;
+
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            UPDATE goldfish_turns
+            SET effective_strategy = COALESCE($effective_strategy, effective_strategy),
+                strategy_reason = COALESCE($strategy_reason, strategy_reason),
+                input_tokens = input_tokens + $input_tokens,
+                output_tokens = output_tokens + $output_tokens,
+                total_tokens = total_tokens + $total_tokens
+            WHERE turn_id = $turn_id;
+            """;
+        command.Parameters.AddWithValue("$effective_strategy", (object?)selection?.Effective.ToString() ?? DBNull.Value);
+        command.Parameters.AddWithValue("$strategy_reason", (object?)selection?.Reason ?? DBNull.Value);
+        command.Parameters.AddWithValue("$input_tokens", usages.Sum(usage => usage.InputTokenCount ?? 0));
+        command.Parameters.AddWithValue("$output_tokens", usages.Sum(usage => usage.OutputTokenCount ?? 0));
+        command.Parameters.AddWithValue("$total_tokens", usages.Sum(usage => usage.TotalTokenCount ?? 0));
+        command.Parameters.AddWithValue("$turn_id", turnId);
+        await command.ExecuteNonQueryAsync(ct);
     }
 
     private static async Task InsertBlobAsync(

@@ -29,6 +29,11 @@ public sealed record GoldfishHarnessTurn
     public string WorkspaceId { get; init; } = string.Empty;
     public string SessionId { get; init; } = string.Empty;
     public string Strategy { get; init; } = nameof(ReasoningStrategyKind.ReAct);
+    public string? EffectiveStrategy { get; init; }
+    public string? StrategyReason { get; init; }
+    public long InputTokens { get; init; }
+    public long OutputTokens { get; init; }
+    public long TotalTokens { get; init; }
     public string? RetryOfTurnId { get; init; }
     public GoldfishTurnStatus Status { get; init; } = GoldfishTurnStatus.Queued;
     public DateTimeOffset CreatedAt { get; init; } = DateTimeOffset.UtcNow;
