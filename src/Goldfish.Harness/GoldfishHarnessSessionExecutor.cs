@@ -28,12 +28,12 @@ public sealed record GoldfishHarnessSessionRequest(
 
 public sealed class GoldfishHarnessSessionExecutor
 {
-    private readonly GoldfishHarnessRunner _runner;
+    private readonly GoldfishHarnessKernel _kernel;
     private readonly GoldfishSessionHistoryStore _historyStore;
     private readonly IMemoryManager _memoryManager;
     private readonly MemoryOptions _memoryOptions;
+    private readonly GoldfishHarnessContextAssembler _contextAssembler;
     private readonly GoldfishSessionQueue _sessionQueue;
-    private readonly IGoldfishSteerSource? _steerSource;
     private readonly IGoldfishRunLifecycle? _lifecycle;
     private readonly ILogger<GoldfishHarnessSessionExecutor> _logger;
 
@@ -45,14 +45,15 @@ public sealed class GoldfishHarnessSessionExecutor
         GoldfishSessionQueue sessionQueue,
         IGoldfishSteerSource? steerSource = null,
         IGoldfishRunLifecycle? lifecycle = null,
-        ILogger<GoldfishHarnessSessionExecutor>? logger = null)
+        ILogger<GoldfishHarnessSessionExecutor>? logger = null,
+        IHarnessTurnEventStore? turnEventStore = null)
     {
-        _runner = runner;
+        _kernel = new GoldfishHarnessKernel(runner, turnEventStore);
         _historyStore = historyStore;
         _memoryManager = memoryManager;
         _memoryOptions = memoryOptions;
+        _contextAssembler = new GoldfishHarnessContextAssembler(historyStore, memoryManager, memoryOptions, steerSource);
         _sessionQueue = sessionQueue;
-        _steerSource = steerSource;
         _lifecycle = lifecycle;
         _logger = logger ?? NullLogger<GoldfishHarnessSessionExecutor>.Instance;
     }
@@ -74,7 +75,7 @@ public sealed class GoldfishHarnessSessionExecutor
                 _lifecycle?.StartRun(request.SessionId, request.AgentInfo.Name);
                 try
                 {
-                    var result = await _runner.RunAsync(queuedRequest, queuedCt);
+                    var result = await _kernel.RunAsync(queuedRequest, queuedCt);
                     foreach (var ev in result.Events)
                     {
                         UpdateReasoningSelectionCache(request, ev);
@@ -106,7 +107,7 @@ public sealed class GoldfishHarnessSessionExecutor
             _lifecycle?.StartRun(request.SessionId, request.AgentInfo.Name);
             try
             {
-                await foreach (var ev in _runner.StreamAsync(queuedRequest, queuedCt).WithCancellation(queuedCt))
+                await foreach (var ev in _kernel.StreamAsync(queuedRequest, queuedCt).WithCancellation(queuedCt))
                 {
                     UpdateReasoningSelectionCache(request, ev);
                     yield return ev;
@@ -157,7 +158,7 @@ public sealed class GoldfishHarnessSessionExecutor
                 _memoryManager,
                 request.MemoryPartition,
                 request.Prompt,
-                MemoryOptionsFor(request.UserProfileScope).UserProfile);
+            _contextAssembler.CreateMemoryOptions(request.UserProfileScope).UserProfile);
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
@@ -174,28 +175,7 @@ public sealed class GoldfishHarnessSessionExecutor
     private async Task<GoldfishHarnessRequest> BuildRequestAsync(
         GoldfishHarnessSessionRequest request,
         CancellationToken ct)
-    {
-        var history = await _historyStore.LoadAsync(request.SessionId);
-        var memoryContext = await BuildMemoryContextAsync(request, history, ct);
-        return new GoldfishHarnessRequest(
-            request.AgentInfo,
-            request.SessionId,
-            request.Prompt,
-            new Microsoft.Extensions.AI.ChatMessage(ChatRole.User, request.Prompt),
-            history,
-            request.MaxOutputTokens,
-            request.Temperature,
-            request.DisableConfigCache,
-            MemoryOptions: _memoryOptions,
-            MemoryContext: memoryContext,
-            SteerSource: _steerSource,
-            SkillOptions: request.SkillOptions,
-            SkillSessionStore: request.SkillSessionStore,
-            ToolExecutionStore: request.ToolExecutionStore,
-            ToolAuthorizationHook: request.ToolAuthorizationHook,
-            ReasoningOptions: request.ReasoningOptions,
-            CachedReasoningSelection: null);
-    }
+        => await _contextAssembler.AssembleAsync(request, ct);
 
     private void UpdateReasoningSelectionCache(
         GoldfishHarnessSessionRequest request,
@@ -212,43 +192,4 @@ public sealed class GoldfishHarnessSessionExecutor
         _historyStore.SetReasoningSelection(request.SessionId, selection);
     }
 
-    private async Task<MemoryContext> BuildMemoryContextAsync(
-        GoldfishHarnessSessionRequest request,
-        IList<ChatMessage> legacyHistory,
-        CancellationToken ct)
-    {
-        var options = MemoryOptionsFor(request.UserProfileScope);
-        var memoryContext = await _memoryManager.BuildContextAsync(request.MemoryPartition, request.Prompt, options);
-        if (memoryContext.ShortTermMessages.Count > 0 || legacyHistory.Count == 0)
-        {
-            return memoryContext;
-        }
-
-        foreach (var message in legacyHistory)
-        {
-            ct.ThrowIfCancellationRequested();
-            await _memoryManager.AddMessageAsync(request.MemoryPartition, message);
-        }
-
-        return await _memoryManager.BuildContextAsync(request.MemoryPartition, request.Prompt, options);
-    }
-
-    private MemoryOptions MemoryOptionsFor(UserProfileScope scope)
-        => new()
-        {
-            ShortTerm = _memoryOptions.ShortTerm,
-            MediumTerm = _memoryOptions.MediumTerm,
-            LongTerm = _memoryOptions.LongTerm,
-            Embedding = _memoryOptions.Embedding,
-            Sqlite = _memoryOptions.Sqlite,
-            Admission = _memoryOptions.Admission,
-            UserProfile = new UserProfileMemoryOptions
-            {
-                Enabled = _memoryOptions.UserProfile.Enabled,
-                AutoExtract = _memoryOptions.UserProfile.AutoExtract,
-                MaxMemories = _memoryOptions.UserProfile.MaxMemories,
-                MinimumConfidence = _memoryOptions.UserProfile.MinimumConfidence,
-                Scope = scope
-            }
-        };
 }

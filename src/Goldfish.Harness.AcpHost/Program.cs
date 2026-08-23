@@ -175,7 +175,8 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
             history,
             new InMemoryMemoryManager(),
             memoryOptions,
-            new GoldfishSessionQueue());
+            new GoldfishSessionQueue(),
+            turnEventStore: new JsonlHarnessTurnEventStore(stateRoot));
         var agentInfo = new AgentInfo
         {
             Id = runtime.AgentId,

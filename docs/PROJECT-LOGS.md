@@ -1,5 +1,12 @@
 # Project Log
 
+## 2026-08-23
+
+- Introduced the self-owned `GoldfishHarnessKernel` turn lifecycle and explicit terminal states.
+- Separated history/memory assembly into `GoldfishHarnessContextAssembler`.
+- Added an append-only turn-event store with JSONL persistence for the standalone ACP host.
+- Preserved ACP as a projection layer and added kernel/ledger regression coverage.
+
 ## 2026-07-19
 
 - Prepared the standalone project for its initial public GitHub release.
