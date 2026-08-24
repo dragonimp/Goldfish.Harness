@@ -110,7 +110,9 @@ public sealed class GoldfishAcpEventProjector
                 or GoldfishEventKind.ReWooGraphCreated
                 or GoldfishEventKind.ReasoningTraceCompleted => MessageChunk("agent_thought_chunk", ev.Delta, ev),
             GoldfishEventKind.TokenUsage => UsageUpdate(ev),
-            GoldfishEventKind.Failed => RuntimeError(ev),
+            // Runtime failures are terminal JSON-RPC errors. Program.cs emits the
+            // extension notification followed by exactly one -32603 response.
+            GoldfishEventKind.Failed => null,
             GoldfishEventKind.Completed => null,
             _ => null
         };
@@ -186,23 +188,6 @@ public sealed class GoldfishAcpEventProjector
             }
         };
     }
-
-    private static object RuntimeError(GoldfishHarnessEvent ev) => new
-    {
-        sessionUpdate = "agent_message_chunk",
-        content = new { type = "text", text = ev.Delta },
-        _meta = new
-        {
-            agentfree = new
-            {
-                eventType = "_agentfree/runtime.error",
-                ev.RunId,
-                ev.EventId,
-                ev.Step,
-                timestamp = ev.Timestamp.ToString("O")
-            }
-        }
-    };
 
     private static object Attachment(string sessionId, object attachment, GoldfishHarnessEvent ev)
     {

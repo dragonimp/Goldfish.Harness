@@ -249,7 +249,14 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
             ct).WithCancellation(ct))
         {
             if (ev.Kind == GoldfishEventKind.Completed) terminal = GoldfishTurnStatus.Completed;
-            else if (ev.Kind == GoldfishEventKind.Failed) terminal = GoldfishTurnStatus.Failed;
+            else if (ev.Kind == GoldfishEventKind.Failed)
+            {
+                terminal = GoldfishTurnStatus.Failed;
+                throw new InvalidOperationException(
+                    string.IsNullOrWhiteSpace(ev.Delta)
+                        ? "Goldfish Harness runtime finished in a failed state."
+                        : ev.Delta);
+            }
             foreach (var frame in _projector.Project(session.SessionId, ev))
             {
                 var envelope = JsonSerializer.SerializeToElement(frame, AcpJson.Options);

@@ -162,6 +162,77 @@ public sealed class AcpHostProcessTests
     }
 
     [Fact]
+    public async Task IndependentProcess_RuntimeFailureUsesExtensionAndJsonRpcErrorTerminal()
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(20));
+        await using var server = FakeOpenAiServer.StartFailure(HttpStatusCode.Unauthorized, "missing test credential");
+        var workspace = Directory.CreateTempSubdirectory("goldfish-acp-failure-workspace-");
+        var state = Directory.CreateTempSubdirectory("goldfish-acp-failure-state-");
+
+        try
+        {
+            using var process = StartHost();
+            await SendAsync(process, new
+            {
+                jsonrpc = "2.0",
+                id = 1,
+                method = "session/new",
+                @params = new
+                {
+                    cwd = workspace.FullName,
+                    _meta = new
+                    {
+                        agentfree = new
+                        {
+                            requestedSessionId = "failure-session",
+                            runtime = new
+                            {
+                                baseUrl = server.BaseUrl,
+                                apiKey = "invalid-test-key",
+                                model = "test-model",
+                                stateRoot = state.FullName
+                            }
+                        }
+                    }
+                }
+            });
+            await ReadUntilResponseAsync(process, 1, timeout.Token);
+
+            await SendAsync(process, new
+            {
+                jsonrpc = "2.0",
+                id = 2,
+                method = "session/prompt",
+                @params = new
+                {
+                    sessionId = "failure-session",
+                    prompt = new[] { new { type = "text", text = "fail" } }
+                }
+            });
+
+            var frames = await ReadUntilResponseWithFramesAsync(process, 2, timeout.Token);
+            Assert.Equal(-32603, frames.Response.GetProperty("error").GetProperty("code").GetInt32());
+            Assert.Contains("401", frames.Response.GetProperty("error").GetProperty("message").GetString());
+            Assert.Single(frames.Notifications, frame =>
+                frame.GetProperty("method").GetString() == "_agentfree/runtime.error");
+            Assert.DoesNotContain(frames.Notifications, frame =>
+                frame.GetProperty("method").GetString() == "session/update"
+                && frame.GetProperty("params").GetProperty("update").GetProperty("sessionUpdate").GetString() == "agent_message_chunk");
+
+            await SendAsync(process, new { jsonrpc = "2.0", id = 3, method = "shutdown", @params = new { } });
+            await ReadUntilResponseAsync(process, 3, timeout.Token);
+            await process.WaitForExitAsync(timeout.Token);
+            Assert.Equal(0, process.ExitCode);
+        }
+        finally
+        {
+            workspace.Delete(recursive: true);
+            state.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task IndependentProcess_CancelsActivePrompt()
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
@@ -343,7 +414,7 @@ public sealed class AcpHostProcessTests
             if (frame.TryGetProperty("id", out var responseId) && responseId.ValueKind == JsonValueKind.Number
                 && responseId.GetInt32() == id)
                 return (frame, notifications);
-            if (frame.TryGetProperty("method", out var method) && method.GetString() == "session/update")
+            if (frame.TryGetProperty("method", out _))
                 notifications.Add(frame);
         }
     }
@@ -370,15 +441,21 @@ public sealed class AcpHostProcessTests
         private readonly TcpListener _listener;
         private readonly string _answer;
         private readonly TimeSpan _responseDelay;
+        private readonly HttpStatusCode? _failureStatusCode;
         private readonly CancellationTokenSource _stop = new();
         private readonly Task _serveTask;
         private int _requestCount;
 
-        private FakeOpenAiServer(TcpListener listener, string answer, TimeSpan responseDelay)
+        private FakeOpenAiServer(
+            TcpListener listener,
+            string answer,
+            TimeSpan responseDelay,
+            HttpStatusCode? failureStatusCode = null)
         {
             _listener = listener;
             _answer = answer;
             _responseDelay = responseDelay;
+            _failureStatusCode = failureStatusCode;
             _serveTask = ServeAsync();
         }
 
@@ -390,6 +467,13 @@ public sealed class AcpHostProcessTests
             var listener = new TcpListener(IPAddress.Loopback, 0);
             listener.Start();
             return new FakeOpenAiServer(listener, answer, responseDelay);
+        }
+
+        public static FakeOpenAiServer StartFailure(HttpStatusCode statusCode, string message)
+        {
+            var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            return new FakeOpenAiServer(listener, message, default, statusCode);
         }
 
         private async Task ServeAsync()
@@ -432,6 +516,16 @@ public sealed class AcpHostProcessTests
             Interlocked.Increment(ref _requestCount);
             if (_responseDelay > TimeSpan.Zero)
                 await Task.Delay(_responseDelay, ct);
+
+            if (_failureStatusCode.HasValue)
+            {
+                var failureBody = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { error = _answer }));
+                var failureHeaders = Encoding.ASCII.GetBytes(
+                    $"HTTP/1.1 {(int)_failureStatusCode.Value} {_failureStatusCode.Value}\r\nContent-Type: application/json\r\nContent-Length: {failureBody.Length}\r\nConnection: close\r\n\r\n");
+                await stream.WriteAsync(failureHeaders, ct);
+                await stream.WriteAsync(failureBody, ct);
+                return;
+            }
 
             var first = JsonSerializer.Serialize(new { choices = new[] { new { delta = new { content = _answer }, finish_reason = (string?)null } } });
             var second = JsonSerializer.Serialize(new { choices = new[] { new { delta = new { }, finish_reason = "stop" } } });
