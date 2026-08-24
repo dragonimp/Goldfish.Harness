@@ -52,13 +52,13 @@ public sealed class AcpProtocolTests
     }
 
     [Fact]
-    public void RuntimeError_IsAcpSessionUpdateWithAgentFreeMetadata()
+    public void RuntimeError_IsAcpExtensionNotificationWithAgentFreeMetadata()
     {
         var json = JsonSerializer.SerializeToElement(GoldfishAcpProtocol.RuntimeError("session-1", "failed", "TestError"));
-        Assert.Equal("session/update", json.GetProperty("method").GetString());
-        var update = json.GetProperty("params").GetProperty("update");
-        Assert.Equal("agent_message_chunk", update.GetProperty("sessionUpdate").GetString());
-        Assert.Equal("_agentfree/runtime.error", update.GetProperty("_meta").GetProperty("agentfree").GetProperty("eventType").GetString());
+        Assert.Equal("_agentfree/runtime.error", json.GetProperty("method").GetString());
+        var parameters = json.GetProperty("params");
+        Assert.Equal("failed", parameters.GetProperty("message").GetString());
+        Assert.Equal("_agentfree/runtime.error", parameters.GetProperty("_meta").GetProperty("agentfree").GetProperty("eventType").GetString());
     }
 
     [Fact]

@@ -176,6 +176,12 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
             {
                 await error.WriteLineAsync(failure.ToString());
                 await WriteAsync(GoldfishAcpProtocol.RuntimeError(session.SessionId, failure.Message, failure.GetType().Name));
+                await WriteAsync(GoldfishAcpProtocol.Error(id, -32603, failure.Message, new
+                {
+                    sessionId,
+                    code = failure.GetType().Name
+                }));
+                return;
             }
             await WriteAsync(GoldfishAcpProtocol.PromptResult(id, stopReason));
         });
@@ -244,7 +250,9 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
                 await WriteAsync(frame);
         }
         ct.ThrowIfCancellationRequested();
-        return terminal == GoldfishTurnStatus.Completed ? "end_turn" : "refusal";
+        if (terminal != GoldfishTurnStatus.Completed)
+            throw new InvalidOperationException("Goldfish Harness runtime finished in a failed state.");
+        return "end_turn";
     }
 
     private async Task CancelSessionAsync(JsonElement? id, JsonElement request)

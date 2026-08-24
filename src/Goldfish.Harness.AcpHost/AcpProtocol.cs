@@ -68,10 +68,14 @@ public static class GoldfishAcpProtocol
         => AcpProtocol.PromptResult(id, stopReason);
 
     public static object RuntimeError(string sessionId, string message, string? code = null)
-        => SessionUpdate(sessionId, new
+        => new
         {
-            sessionUpdate = "agent_message_chunk",
-            content = new { type = "text", text = $"Runtime execution failed: {message}" },
+            jsonrpc = JsonRpcVersion,
+            method = "_agentfree/runtime.error",
+            @params = new
+            {
+                sessionId,
+                message,
             _meta = new
             {
                 agentfree = new
@@ -82,7 +86,8 @@ public static class GoldfishAcpProtocol
                     timestamp = DateTimeOffset.UtcNow.ToString("O")
                 }
             }
-        });
+            }
+        };
 }
 
 public sealed class GoldfishAcpEventProjector
