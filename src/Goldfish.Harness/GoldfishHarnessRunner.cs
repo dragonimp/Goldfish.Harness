@@ -181,13 +181,13 @@ public sealed class GoldfishHarnessRunner
                 result.Answer = "[Goldfish 无输出]";
             }
             if (IsFinalTextOnly(request)
-                && (RequiresToolBeforeFinal(request, result.ToolCalls.Count > 0)
+                && (RequiresToolBeforeFinal(request, HasRequiredSuccessfulToolResult(request, result.ToolCalls))
                     || ShouldContinueFinalTextOnly(result.Answer, toolFunctions.Count > 0)))
             {
                 messages.Add(new MsChatMessage(ChatRole.Assistant, raw));
                 messages.Add(new MsChatMessage(
                     ChatRole.User,
-                    RequiresToolBeforeFinal(request, result.ToolCalls.Count > 0)
+                    RequiresToolBeforeFinal(request, HasRequiredSuccessfulToolResult(request, result.ToolCalls))
                         ? BuildRequiredToolCorrection()
                         : BuildFinalTextCorrection(result.Answer)));
                 result.Answer = string.Empty;
@@ -211,19 +211,28 @@ public sealed class GoldfishHarnessRunner
             return result;
         }
 
-        messages.Add(new MsChatMessage(ChatRole.User, "请停止继续调用工具，基于已有观察给出最终回答。"));
-        var finalResponse = await _chatClient.GetResponseAsync(messages, BuildChatOptions(request, new Dictionary<string, ToolFunction>()), ct);
-        result.Answer = NormalizeFinalAnswer(
-            CleanFinalAnswer(ParseReactAction(finalResponse.Text ?? string.Empty).Answer ?? finalResponse.Text ?? string.Empty));
-        if (string.IsNullOrWhiteSpace(result.Answer))
+        if (RequiresToolBeforeFinal(request, HasRequiredSuccessfulToolResult(request, result.ToolCalls)))
         {
-            result.Answer = "已达到 Goldfish 最大推理轮次，但没有生成可用最终回答。";
+            // Do not ask the model for a last answer here.  Without an authoritative
+            // tool result it could reuse stale conversation text or invent a balance.
+            result.Answer = BuildRequiredToolUnavailableAnswer();
         }
-        var finalReflection = await ReflectFinalAnswerIfNeededAsync(request, reasoningSelection, messages, result.Answer, ct);
-        if (finalReflection is not null)
+        else
         {
-            result.Answer = finalReflection.Answer;
-            result.Events.Add(GoldfishHarnessEvent.ReflectionCompleted(finalReflection));
+            messages.Add(new MsChatMessage(ChatRole.User, "请停止继续调用工具，基于已有观察给出最终回答。"));
+            var finalResponse = await _chatClient.GetResponseAsync(messages, BuildChatOptions(request, new Dictionary<string, ToolFunction>()), ct);
+            result.Answer = NormalizeFinalAnswer(
+                CleanFinalAnswer(ParseReactAction(finalResponse.Text ?? string.Empty).Answer ?? finalResponse.Text ?? string.Empty));
+            if (string.IsNullOrWhiteSpace(result.Answer))
+            {
+                result.Answer = "已达到 Goldfish 最大推理轮次，但没有生成可用最终回答。";
+            }
+            var finalReflection = await ReflectFinalAnswerIfNeededAsync(request, reasoningSelection, messages, result.Answer, ct);
+            if (finalReflection is not null)
+            {
+                result.Answer = finalReflection.Answer;
+                result.Events.Add(GoldfishHarnessEvent.ReflectionCompleted(finalReflection));
+            }
         }
         if (plan is not null)
         {
@@ -400,7 +409,7 @@ public sealed class GoldfishHarnessRunner
                     traceEvents.Add(toolCallStartEvent);
                     yield return toolCallStartEvent;
                     var record = await ExecuteFunctionCallAsync(request, runId, step, functionCall, toolFunctions, ct);
-                    toolWasUsed = true;
+                    toolWasUsed = toolWasUsed || record.Success;
                     var toolResultEvent = GoldfishHarnessEvent.ToolResult(step, record);
                     traceEvents.Add(toolResultEvent);
                     yield return toolResultEvent;
@@ -418,6 +427,7 @@ public sealed class GoldfishHarnessRunner
                         traceEvents.Add(retryCallStartEvent);
                         yield return retryCallStartEvent;
                         var retryRecord = await ExecuteFunctionCallAsync(request, runId, step, retryCall, toolFunctions, ct);
+                        toolWasUsed = toolWasUsed || retryRecord.Success;
                         var retryResultEvent = GoldfishHarnessEvent.ToolResult(step, retryRecord);
                         traceEvents.Add(retryResultEvent);
                         yield return retryResultEvent;
@@ -451,7 +461,7 @@ public sealed class GoldfishHarnessRunner
                 traceEvents.Add(toolCallStartEvent);
                 yield return toolCallStartEvent;
                 var record = await ExecuteLegacyToolActionAsync(request, runId, step, action, legacyToolCallId, ct);
-                toolWasUsed = true;
+                toolWasUsed = toolWasUsed || record.Success;
                 var toolResultEvent = GoldfishHarnessEvent.ToolResult(step, record);
                 traceEvents.Add(toolResultEvent);
                 yield return toolResultEvent;
@@ -516,6 +526,15 @@ public sealed class GoldfishHarnessRunner
                 yield return traceCompletedEvent;
             }
             yield return GoldfishHarnessEvent.Completed(step, answer);
+            yield break;
+        }
+
+        var requiredToolWasSuccessful = HasRequiredSuccessfulToolResult(request, traceEvents);
+        if (RequiresToolBeforeFinal(request, requiredToolWasSuccessful))
+        {
+            var unavailableAnswer = BuildRequiredToolUnavailableAnswer();
+            yield return GoldfishHarnessEvent.Text(_maxReactSteps + 1, unavailableAnswer);
+            yield return GoldfishHarnessEvent.Completed(_maxReactSteps + 1, unavailableAnswer);
             yield break;
         }
 
@@ -585,11 +604,35 @@ public sealed class GoldfishHarnessRunner
             && bool.TryParse(required, out var enabled)
             && enabled;
 
+    private static bool HasRequiredSuccessfulToolResult(
+        GoldfishHarnessRequest request,
+        IEnumerable<ToolCallRecord> toolCalls)
+    {
+        var requiredPrefix = request.AgentInfo.ExtraData.GetValueOrDefault("GoldfishRequiredToolPrefix");
+        return toolCalls.Any(record => record.Success
+            && (string.IsNullOrWhiteSpace(requiredPrefix)
+                || record.ToolId.Contains(requiredPrefix, StringComparison.OrdinalIgnoreCase)));
+    }
+
+    private static bool HasRequiredSuccessfulToolResult(
+        GoldfishHarnessRequest request,
+        IEnumerable<GoldfishHarnessEvent> events)
+    {
+        var requiredPrefix = request.AgentInfo.ExtraData.GetValueOrDefault("GoldfishRequiredToolPrefix");
+        return events.Any(ev => ev.Kind == GoldfishEventKind.ToolResult
+            && ev.Success == true
+            && (string.IsNullOrWhiteSpace(requiredPrefix)
+                || (ev.ToolId?.Contains(requiredPrefix, StringComparison.OrdinalIgnoreCase) ?? false)));
+    }
+
     private static string BuildRequiredToolCorrection()
         => """
 [Skill 工具执行约束]
-当前是查询型语音请求，活动 Skill 已声明结果必须来自工具，但本轮尚未调用任何工具，因此不能输出 final。现在必须调用最合适的只读查询工具；拿到结果后再输出可直接播报的最终答案。
+当前是查询型请求，活动 Skill 已声明结果必须来自工具，但本轮尚未取得所需工具的成功结果，因此不能输出 final。现在必须调用最合适的只读查询工具；拿到成功结果后再输出最终答案。
 """;
+
+    private static string BuildRequiredToolUnavailableAnswer()
+        => "当前查询未完成，暂不能提供积分数值，请稍后重试。";
 
     private static bool IsProvisionalFinalAnswer(string? answer)
     {

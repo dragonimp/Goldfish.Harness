@@ -583,6 +583,49 @@ public sealed class GoldfishHarnessRunnerTests
     }
 
     [Fact]
+    public async Task RunAsync_RequiredToolWithoutSuccess_ReturnsSafeIncompleteResponse()
+    {
+        var chatClient = new QueueChatClient("玥玥当前有 100 分。");
+        var runner = new GoldfishHarnessRunner(
+            chatClient,
+            new ToolRegistry(),
+            maxReactSteps: 1,
+            skillRegistry: null);
+        var request = RequiredFamilyRewardRequest("查询玥玥积分");
+
+        var result = await runner.RunAsync(request, TestContext.Current.CancellationToken);
+
+        Assert.Equal("当前查询未完成，暂不能提供积分数值，请稍后重试。", result.Answer);
+        Assert.DoesNotContain("100", result.Answer);
+        Assert.Single(chatClient.Calls);
+    }
+
+    [Fact]
+    public async Task StreamAsync_RequiredToolWithoutSuccess_NeverStreamsModelScore()
+    {
+        var chatClient = new QueueChatClient("玥玥当前有 100 分。");
+        var runner = new GoldfishHarnessRunner(
+            chatClient,
+            new ToolRegistry(),
+            maxReactSteps: 1,
+            skillRegistry: null);
+        var request = RequiredFamilyRewardRequest("查询玥玥积分");
+        var events = new List<GoldfishHarnessEvent>();
+
+        await foreach (var ev in runner.StreamAsync(request, TestContext.Current.CancellationToken))
+        {
+            events.Add(ev);
+        }
+
+        Assert.DoesNotContain(events, ev => ev.Kind == GoldfishEventKind.TextDelta && ev.Delta.Contains("100"));
+        Assert.Contains(events, ev => ev.Kind == GoldfishEventKind.TextDelta
+            && ev.Delta == "当前查询未完成，暂不能提供积分数值，请稍后重试。");
+        Assert.Contains(events, ev => ev.Kind == GoldfishEventKind.Completed
+            && ev.Delta == "当前查询未完成，暂不能提供积分数值，请稍后重试。");
+        Assert.Single(chatClient.Calls);
+    }
+
+    [Fact]
     public async Task StreamAsync_FinalTextOnlyContinuesAfterUnresolvedExactNameMiss()
     {
         var chatClient = new QueueChatClient(
@@ -955,6 +998,26 @@ public sealed class GoldfishHarnessRunnerTests
         var toolKind = Enum.Parse(kindType!, "Tool");
         return Activator.CreateInstance(actionType!, toolKind, null, toolId, arguments, null)!;
     }
+
+    private static GoldfishHarnessRequest RequiredFamilyRewardRequest(string prompt)
+        => new(
+            new AgentInfo
+            {
+                Id = "family-reward-agent",
+                Name = "家庭积分应用",
+                SystemPrompt = "积分查询必须成功调用家庭积分工具后才能回答。",
+                ExtraData = new Dictionary<string, string>
+                {
+                    ["RuntimeResponseMode"] = "final_text_only",
+                    ["GoldfishRequireToolBeforeFinal"] = "true",
+                    ["GoldfishRequiredToolPrefix"] = "family_reward"
+                }
+            },
+            "family-reward-session",
+            prompt,
+            new Microsoft.Extensions.AI.ChatMessage(ChatRole.User, prompt),
+            [],
+            ReasoningOptions: new ReasoningOptions { Strategy = ReasoningStrategyKind.ReAct });
 
     private sealed class RecordingTool : ITool
     {
