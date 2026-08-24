@@ -2,5 +2,6 @@
   "sourceRepository": "AgentFree",
   "sourceCommit": "2bf97f9895a5111403b7272a0dbff311de67191b",
   "schemaRelease": "schema-v1.21.0",
+  "schemaSha256": "caf62ff962ada396878372ced11efb2c6764e59d90919a38583c319948931a42",
   "sourceTreeSha256": "c65e609e7c8b25a2baff194a43bdae913fee01876cb92f2f9295ee75e5642cca"
 }
