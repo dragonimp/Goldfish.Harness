@@ -3,6 +3,8 @@ using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Goldfish.Acp;
+using Goldfish.Acp.Protocol.V1;
 using Goldfish.Harness;
 
 await using var host = new AcpHost(Console.In, Console.Out, Console.Error);
@@ -10,7 +12,7 @@ return await host.RunAsync();
 
 public static class AcpHostAssembly;
 
-internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter error) : IAsyncDisposable
+internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter error) : AcpAgentBase, IAsyncDisposable
 {
     private readonly ConcurrentDictionary<string, HostSession> _sessions = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, ActiveRun> _activeRuns = new(StringComparer.Ordinal);
@@ -46,13 +48,8 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
                     switch (method)
                     {
                         case "initialize":
-                            await WriteAsync(GoldfishAcpProtocol.Response(
-                                id,
-                                GoldfishAcpProtocol.InitializeResult(
-                                    "Goldfish.Harness",
-                                    typeof(AcpHost).Assembly.GetName().Version?.ToString() ?? "1.0.0",
-                                    SqliteHarnessStateStore.CurrentSchemaVersion,
-                                    _stateOptions.Mode.ToString())));
+                            await WriteAsync(GoldfishAcpProtocol.Response(id, await InitializeAsync(
+                                DeserializeParams<InitializeRequest>(request), CancellationToken.None)));
                             break;
                         case "session/new":
                             await CreateSessionAsync(id, request);
@@ -94,97 +91,103 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
         _writeLock.Dispose();
     }
 
-    private async Task CreateSessionAsync(JsonElement? id, JsonElement request)
-    {
-        var parameters = RequiredObject(request, "params");
-        var cwd = ReadString(parameters, "cwd");
-        if (string.IsNullOrWhiteSpace(cwd) || !Path.IsPathFullyQualified(cwd))
-            throw new InvalidOperationException("session/new requires an absolute cwd.");
+    public override ValueTask<InitializeResponse> InitializeAsync(InitializeRequest request, CancellationToken ct)
+        => ValueTask.FromResult(AcpProtocol.Convert<InitializeResponse>(GoldfishAcpProtocol.InitializeResult(
+            "Goldfish.Harness",
+            typeof(AcpHost).Assembly.GetName().Version?.ToString() ?? "1.0.0",
+            SqliteHarnessStateStore.CurrentSchemaVersion,
+            _stateOptions.Mode.ToString())));
 
+    public override ValueTask<NewSessionResponse> NewSessionAsync(NewSessionRequest request, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(request.Cwd) || !Path.IsPathFullyQualified(request.Cwd))
+            throw new InvalidOperationException("session/new requires an absolute cwd.");
+        var parameters = JsonSerializer.SerializeToElement(request, AcpJson.Options);
         var sessionId = ReadRequestedSessionId(parameters) ?? Guid.NewGuid().ToString("N");
         var runtime = ReadRuntime(parameters);
         var scope = _runtimeScopes.GetOrAdd(runtime.StateRoot,
             root => new HostRuntimeScope(root, _stateOptions));
-        var session = new HostSession(sessionId, Path.GetFullPath(cwd), runtime, scope);
+        var session = new HostSession(sessionId, Path.GetFullPath(request.Cwd), runtime, scope);
         if (!_sessions.TryAdd(sessionId, session))
             throw new InvalidOperationException($"ACP session already exists: {sessionId}");
-
-        await WriteAsync(GoldfishAcpProtocol.Response(id, new
+        return ValueTask.FromResult(AcpProtocol.Convert<NewSessionResponse>(new
         {
             sessionId,
             _meta = new { agentfree = new { runtime = "goldfish-harness", cwd = session.Cwd } }
         }));
     }
 
+    private async Task CreateSessionAsync(JsonElement? id, JsonElement request)
+    {
+        await WriteAsync(GoldfishAcpProtocol.Response(id, await NewSessionAsync(
+            DeserializeParams<NewSessionRequest>(request), CancellationToken.None)));
+    }
+
     private void StartPrompt(JsonElement? id, JsonElement request)
     {
-        var parameters = RequiredObject(request, "params");
-        var sessionId = ReadString(parameters, "sessionId")
-            ?? throw new InvalidOperationException("session/prompt requires sessionId.");
-        if (!_sessions.TryGetValue(sessionId, out var session))
+        var promptRequest = DeserializeParams<PromptRequest>(request);
+        var sessionId = promptRequest.SessionId;
+        if (!_sessions.ContainsKey(sessionId))
             throw new InvalidOperationException($"ACP session not found: {sessionId}");
-        var run = new ActiveRun();
-        if (!_activeRuns.TryAdd(sessionId, run))
-        {
-            run.Dispose();
-            throw new InvalidOperationException($"ACP session already has an active run: {sessionId}");
-        }
-
-        var prompt = ReadPrompt(parameters);
-        var promptMetadata = ReadPromptMetadata(parameters);
-        var turnId = string.IsNullOrWhiteSpace(promptMetadata.TurnId)
-            ? $"harness-{Guid.NewGuid():n}"
-            : promptMetadata.TurnId;
-        var requestId = string.IsNullOrWhiteSpace(promptMetadata.RequestId)
-            ? Guid.NewGuid().ToString("n")
-            : promptMetadata.RequestId;
-        run.BindRuntimeCancellation(() => session.Scope.Runtime.Cancel(turnId));
         _ = Task.Run(async () =>
         {
-            Exception? failure = null;
-            var stopReason = "end_turn";
             try
             {
-                stopReason = await ExecutePromptAsync(session, prompt, promptMetadata,
-                    turnId, requestId, run.Token);
-                if (run.CancelRequested) stopReason = "cancelled";
-            }
-            catch (OperationCanceledException)
-            {
-                stopReason = "cancelled";
+                var result = await PromptAsync(promptRequest, new JsonLineSessionContext(this, sessionId), CancellationToken.None);
+                await WriteAsync(new AcpJsonRpcResponse<PromptResponse>(id, result));
             }
             catch (Exception ex)
             {
-                if (run.CancelRequested)
-                {
-                    stopReason = "cancelled";
-                }
-                else
-                {
-                    failure = ex;
-                    stopReason = "refusal";
-                }
-            }
-            finally
-            {
-                _activeRuns.TryRemove(sessionId, out _);
-                run.Completion.TrySetResult();
-                run.Dispose();
-            }
-
-            if (failure is not null)
-            {
-                await error.WriteLineAsync(failure.ToString());
-                await WriteAsync(GoldfishAcpProtocol.RuntimeError(session.SessionId, failure.Message, failure.GetType().Name));
-                await WriteAsync(GoldfishAcpProtocol.Error(id, -32603, failure.Message, new
+                await error.WriteLineAsync(ex.ToString());
+                await WriteAsync(GoldfishAcpProtocol.RuntimeError(sessionId, ex.Message, ex.GetType().Name));
+                await WriteAsync(GoldfishAcpProtocol.Error(id, -32603, ex.Message, new
                 {
                     sessionId,
-                    code = failure.GetType().Name
+                    code = ex.GetType().Name
                 }));
-                return;
             }
-            await WriteAsync(GoldfishAcpProtocol.PromptResult(id, stopReason));
         });
+    }
+
+    public override async ValueTask<PromptResponse> PromptAsync(
+        PromptRequest request,
+        IAcpSessionContext context,
+        CancellationToken ct)
+    {
+        if (!_sessions.TryGetValue(request.SessionId, out var session))
+            throw new InvalidOperationException($"ACP session not found: {request.SessionId}");
+        var run = new ActiveRun();
+        if (!_activeRuns.TryAdd(request.SessionId, run))
+        {
+            run.Dispose();
+            throw new InvalidOperationException($"ACP session already has an active run: {request.SessionId}");
+        }
+        var parameters = JsonSerializer.SerializeToElement(request, AcpJson.Options);
+        var prompt = ReadPrompt(parameters);
+        var promptMetadata = ReadPromptMetadata(parameters);
+        var turnId = string.IsNullOrWhiteSpace(promptMetadata.TurnId) ? $"harness-{Guid.NewGuid():n}" : promptMetadata.TurnId;
+        var requestId = string.IsNullOrWhiteSpace(promptMetadata.RequestId) ? Guid.NewGuid().ToString("n") : promptMetadata.RequestId;
+        run.BindRuntimeCancellation(() => session.Scope.Runtime.Cancel(turnId));
+        try
+        {
+            var stopReason = await ExecutePromptAsync(session, prompt, promptMetadata, turnId, requestId, context, run.Token);
+            if (run.CancelRequested) stopReason = "cancelled";
+            return new PromptResponse { StopReason = stopReason };
+        }
+        catch (OperationCanceledException) when (run.CancelRequested)
+        {
+            return new PromptResponse { StopReason = "cancelled" };
+        }
+        catch (Exception) when (run.CancelRequested)
+        {
+            return new PromptResponse { StopReason = "cancelled" };
+        }
+        finally
+        {
+            _activeRuns.TryRemove(request.SessionId, out _);
+            run.Completion.TrySetResult();
+            run.Dispose();
+        }
     }
 
     private async Task<string> ExecutePromptAsync(
@@ -193,6 +196,7 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
         HostPromptMetadata promptMetadata,
         string turnId,
         string requestId,
+        IAcpSessionContext acpContext,
         CancellationToken ct)
     {
         var runtime = session.Runtime;
@@ -205,7 +209,7 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
         var tools = await session.Scope.GetToolsAsync(session.Cwd, runtime, ct);
         var skills = session.Scope.GetSkills(runtime.SkillsRoot);
         var runner = new GoldfishHarnessRunner(chatClient, tools, skillRegistry: skills);
-        var agentInfo = new AgentInfo
+        var agentInfo = new Goldfish.Harness.AgentInfo
         {
             Id = runtime.AgentId,
             Name = runtime.AgentName,
@@ -247,7 +251,13 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
             if (ev.Kind == GoldfishEventKind.Completed) terminal = GoldfishTurnStatus.Completed;
             else if (ev.Kind == GoldfishEventKind.Failed) terminal = GoldfishTurnStatus.Failed;
             foreach (var frame in _projector.Project(session.SessionId, ev))
-                await WriteAsync(frame);
+            {
+                var envelope = JsonSerializer.SerializeToElement(frame, AcpJson.Options);
+                var update = envelope.GetProperty("params").GetProperty("update")
+                    .Deserialize<SessionUpdate>(AcpJson.Options)
+                    ?? throw new InvalidDataException("Harness projector returned an invalid session update.");
+                await acpContext.UpdateAsync(update, ct);
+            }
         }
         ct.ThrowIfCancellationRequested();
         if (terminal != GoldfishTurnStatus.Completed)
@@ -257,16 +267,20 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
 
     private async Task CancelSessionAsync(JsonElement? id, JsonElement request)
     {
-        var parameters = RequiredObject(request, "params");
-        var sessionId = ReadString(parameters, "sessionId")
-            ?? throw new InvalidOperationException("session/cancel requires sessionId.");
+        var notification = DeserializeParams<CancelNotification>(request);
+        var sessionId = notification.SessionId;
         var cancelled = _activeRuns.TryGetValue(sessionId, out var run);
-        if (run is not null)
+        await CancelAsync(notification, CancellationToken.None);
+        await WriteAsync(GoldfishAcpProtocol.Response(id, new { cancelled }));
+    }
+
+    public override async ValueTask CancelAsync(CancelNotification notification, CancellationToken ct)
+    {
+        if (_activeRuns.TryGetValue(notification.SessionId, out var run))
         {
             run.Cancel();
-            await run.Completion.Task;
+            await run.Completion.Task.WaitAsync(ct);
         }
-        await WriteAsync(GoldfishAcpProtocol.Response(id, new { cancelled }));
     }
 
     private async Task ResetSessionAsync(JsonElement? id, JsonElement request)
@@ -348,6 +362,22 @@ internal sealed class AcpHost(TextReader input, TextWriter output, TextWriter er
         {
             _writeLock.Release();
         }
+    }
+
+    private static T DeserializeParams<T>(JsonElement request)
+        => RequiredObject(request, "params").Deserialize<T>(AcpJson.Options)
+            ?? throw new InvalidOperationException($"ACP params cannot be deserialized as {typeof(T).Name}.");
+
+    private sealed class JsonLineSessionContext(AcpHost host, string sessionId) : IAcpSessionContext
+    {
+        public string SessionId { get; } = sessionId;
+
+        public ValueTask UpdateAsync(SessionUpdate update, CancellationToken ct)
+            => new(host.WriteAsync(AcpProtocol.SessionUpdate(SessionId, update)));
+
+        public ValueTask<TResponse> RequestAsync<TRequest, TResponse>(string method, TRequest request, CancellationToken ct)
+            => ValueTask.FromException<TResponse>(
+                new NotSupportedException("Bidirectional ACP requests are handled by the host permission broker."));
     }
 
     private static HostRuntime ReadRuntime(JsonElement parameters)

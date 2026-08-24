@@ -97,7 +97,7 @@ public sealed class AcpHostProcessTests
                 @params = new
                 {
                     sessionId = "process-session",
-                    prompt = "hello",
+                    prompt = new[] { new { type = "text", text = "hello" } },
                     _meta = new { agentfree = new { turnId = "ignored-duplicate", requestId = "gateway-request-1" } }
                 }
             });
@@ -197,7 +197,7 @@ public sealed class AcpHostProcessTests
                 jsonrpc = "2.0",
                 id = 2,
                 method = "session/prompt",
-                @params = new { sessionId = "cancel-session", prompt = "wait" }
+                @params = new { sessionId = "cancel-session", prompt = new[] { new { type = "text", text = "wait" } } }
             });
 
             while (server.RequestCount == 0)
@@ -264,7 +264,7 @@ public sealed class AcpHostProcessTests
                 jsonrpc = "2.0",
                 id = 2,
                 method = "session/prompt",
-                @params = new { sessionId = "cancel-barrier-session", prompt = "wait" }
+                @params = new { sessionId = "cancel-barrier-session", prompt = new[] { new { type = "text", text = "wait" } } }
             });
             while (server.RequestCount == 0)
                 await Task.Delay(10, timeout.Token);
@@ -284,7 +284,7 @@ public sealed class AcpHostProcessTests
                 jsonrpc = "2.0",
                 id = 4,
                 method = "session/prompt",
-                @params = new { sessionId = "cancel-barrier-session", prompt = "continue" }
+                @params = new { sessionId = "cancel-barrier-session", prompt = new[] { new { type = "text", text = "continue" } } }
             });
             var nextPrompt = await ReadUntilResponseAsync(process, 4, timeout.Token);
             Assert.False(nextPrompt.TryGetProperty("error", out _));
