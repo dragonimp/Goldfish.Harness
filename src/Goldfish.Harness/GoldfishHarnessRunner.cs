@@ -481,14 +481,15 @@ public sealed class GoldfishHarnessRunner
             {
                 answer = "[Goldfish 无输出]";
             }
+            var hasRequiredToolResultBeforeAnswer = HasRequiredSuccessfulToolResult(request, traceEvents);
             if (finalTextOnly
-                && (RequiresToolBeforeFinal(request, toolWasUsed)
+                && (RequiresToolBeforeFinal(request, hasRequiredToolResultBeforeAnswer)
                     || ShouldContinueFinalTextOnly(answer, toolFunctions.Count > 0)))
             {
                 messages.Add(new MsChatMessage(ChatRole.Assistant, raw));
                 messages.Add(new MsChatMessage(
                     ChatRole.User,
-                    RequiresToolBeforeFinal(request, toolWasUsed)
+                    RequiresToolBeforeFinal(request, hasRequiredToolResultBeforeAnswer)
                         ? BuildRequiredToolCorrection()
                         : BuildFinalTextCorrection(answer)));
                 yield return GoldfishHarnessEvent.Thinking(step, "检测到过程占位话术，继续完成任务后再输出最终答复。");

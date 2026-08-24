@@ -626,6 +626,36 @@ public sealed class GoldfishHarnessRunnerTests
     }
 
     [Fact]
+    public async Task StreamAsync_RequiredFamilyRewardTool_DoesNotAcceptAnUnrelatedSuccessfulTool()
+    {
+        var chatClient = new QueueChatClient(
+            """{"action":"tool","tool":"goldfish_skill_index","arguments":{}}""",
+            "玥玥当前有 100 分。");
+        var registry = new ToolRegistry();
+        registry.Register(new NamedRecordingTool("goldfish_skill_index"));
+        var runner = new GoldfishHarnessRunner(
+            chatClient,
+            registry,
+            maxReactSteps: 2,
+            skillRegistry: null);
+        var events = new List<GoldfishHarnessEvent>();
+
+        await foreach (var ev in runner.StreamAsync(
+            RequiredFamilyRewardRequest("查询玥玥积分"),
+            TestContext.Current.CancellationToken))
+        {
+            events.Add(ev);
+        }
+
+        Assert.Contains(events, ev => ev.Kind == GoldfishEventKind.ToolResult
+            && ev.ToolId == "goldfish_skill_index"
+            && ev.Success == true);
+        Assert.DoesNotContain(events, ev => ev.Kind == GoldfishEventKind.TextDelta && ev.Delta.Contains("100"));
+        Assert.Contains(events, ev => ev.Kind == GoldfishEventKind.TextDelta
+            && ev.Delta == "当前查询未完成，暂不能提供积分数值，请稍后重试。");
+    }
+
+    [Fact]
     public async Task StreamAsync_FinalTextOnlyContinuesAfterUnresolvedExactNameMiss()
     {
         var chatClient = new QueueChatClient(
@@ -1039,6 +1069,23 @@ public sealed class GoldfishHarnessRunnerTests
                 Data = new { ok = true }
             });
         }
+    }
+
+    private sealed class NamedRecordingTool : ITool
+    {
+        public NamedRecordingTool(string id) => Id = id;
+
+        public string Id { get; }
+        public string Name => Id;
+        public string Description => "Records a successful internal tool call.";
+        public string ParametersSchema => """{"type":"object","additionalProperties":true}""";
+        public Task<bool> IsAvailableAsync() => Task.FromResult(true);
+
+        public Task<ToolResult> ExecuteAsync(string arguments) => Task.FromResult(new ToolResult
+        {
+            Success = true,
+            Data = new { ok = true }
+        });
     }
 
     private sealed class DenyToolAuthorizationHook(string reason) : IToolAuthorizationHook
