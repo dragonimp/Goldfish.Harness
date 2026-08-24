@@ -1,24 +1,22 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Goldfish.Acp;
 using Microsoft.Extensions.AI;
 
 namespace Goldfish.Harness;
 
 public static class GoldfishAcpProtocol
 {
-    public const int Version = 1;
-    public const string JsonRpcVersion = "2.0";
+    public const int Version = AcpConstants.ProtocolVersion;
+    public const string JsonRpcVersion = AcpConstants.JsonRpcVersion;
 
-    public static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
-    {
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-    };
+    public static JsonSerializerOptions JsonOptions => AcpJson.Options;
 
     public static object InitializeResult(
         string name,
         string version,
         int? schemaVersion = null,
-        string? stateMode = null) => new
+        string? stateMode = null) => AcpProtocol.Convert<Goldfish.Acp.Protocol.V1.InitializeResponse>(new
     {
         protocolVersion = Version,
         agentCapabilities = new
@@ -50,31 +48,24 @@ public static class GoldfishAcpProtocol
                 }
             }
         }
-    };
+    });
 
-    public static object Response(object? id, object? result) => new
-    {
-        jsonrpc = JsonRpcVersion,
-        id,
-        result
-    };
+    public static object Response(object? id, object? result)
+        => new AcpJsonRpcResponse<object?>(id, result);
 
-    public static object Error(object? id, int code, string message, object? data = null) => new
-    {
-        jsonrpc = JsonRpcVersion,
-        id,
-        error = new { code, message, data }
-    };
+    public static object Error(object? id, int code, string message, object? data = null)
+        => new AcpJsonRpcErrorResponse(
+            id,
+            new AcpJsonRpcError(
+                code,
+                message,
+                data == null ? null : JsonSerializer.SerializeToElement(data, AcpJson.Options)));
 
-    public static object SessionUpdate(string sessionId, object update) => new
-    {
-        jsonrpc = JsonRpcVersion,
-        method = "session/update",
-        @params = new { sessionId, update }
-    };
+    public static object SessionUpdate(string sessionId, object update)
+        => AcpProtocol.SessionUpdate(sessionId, update);
 
     public static object PromptResult(object? id, string stopReason = "end_turn")
-        => Response(id, new { stopReason });
+        => AcpProtocol.PromptResult(id, stopReason);
 
     public static object RuntimeError(string sessionId, string message, string? code = null)
         => SessionUpdate(sessionId, new

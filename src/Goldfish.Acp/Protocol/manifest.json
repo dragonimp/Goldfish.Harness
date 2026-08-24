@@ -1,0 +1,7 @@
+{
+  "source": "agentclientprotocol/agent-client-protocol",
+  "release": "schema-v1.21.0",
+  "protocolVersion": 1,
+  "schemaSha256": "caf62ff962ada396878372ced11efb2c6764e59d90919a38583c319948931a42",
+  "metaSha256": "061edb6efa8fb2aa2792459a86ec7268de5fe665bba48b2ffe7939df01481f88"
+}
