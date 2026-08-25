@@ -1,7 +1,6 @@
 <Solution>
   <Folder Name="/src/">
   <Project Path="src/Goldfish.Harness/Goldfish.Harness.csproj" />
-  <Project Path="src/Goldfish.Acp/Goldfish.Acp.csproj" />
     <Project Path="src/Goldfish.Harness.AcpHost/Goldfish.Harness.AcpHost.csproj" />
   </Folder>
   <Folder Name="/tests/">
