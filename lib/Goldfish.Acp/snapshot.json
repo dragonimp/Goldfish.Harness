@@ -1,11 +1,11 @@
 {
   "sourceRepository": "AgentFree",
   "sourceProject": "src/Goldfish.Acp/Goldfish.Acp.csproj",
-  "sourceCommit": "2bf97f9895a5111403b7272a0dbff311de67191b",
+  "sourceCommit": "ca812bd21f9a903ee689b8f7a095a794edd9d8cf",
   "schemaRelease": "schema-v1.21.0",
   "schemaSha256": "caf62ff962ada396878372ced11efb2c6764e59d90919a38583c319948931a42",
-  "sourceTreeSha256": "c65e609e7c8b25a2baff194a43bdae913fee01876cb92f2f9295ee75e5642cca",
+  "sourceTreeSha256": "f992453512b36156dbb7314e95279e290bff17f5cb6c6ed3bd14b20de77d5d4a",
   "targetFramework": "net10.0",
-  "assemblySha256": "49ef5d6f00a7b3abb3ba7631b1b31a89a6b699841fe3aa6fdee8ef1f89f2c534",
-  "artifactTreeSha256": "ef05191fdaa9796f93028360f00cf78be1e5a4df1b7e215ffbc9a77a2b810ddc"
+  "assemblySha256": "d7df47f4706a1a0116ef85830ca489aa962e1af52323204701d51e2c301fb2eb",
+  "artifactTreeSha256": "72e79e959c2e116576974d23c8acdf92e51e31d9db8e785f6fd5ad5f528bfe48"
 }
