@@ -184,11 +184,14 @@ public sealed class GoldfishHarnessRunner
                 && (RequiresToolBeforeFinal(request, HasRequiredSuccessfulToolResult(request, result.ToolCalls))
                     || ShouldContinueFinalTextOnly(result.Answer, toolFunctions.Count > 0)))
             {
+                var requiredToolMissing = RequiresToolBeforeFinal(
+                    request,
+                    HasRequiredSuccessfulToolResult(request, result.ToolCalls));
                 messages.Add(new MsChatMessage(ChatRole.Assistant, raw));
                 messages.Add(new MsChatMessage(
                     ChatRole.User,
-                    RequiresToolBeforeFinal(request, HasRequiredSuccessfulToolResult(request, result.ToolCalls))
-                        ? BuildRequiredToolCorrection()
+                    requiredToolMissing
+                        ? BuildRequiredToolCorrection(HasAttemptedFamilyRewardAdjustment(result.ToolCalls))
                         : BuildFinalTextCorrection(result.Answer)));
                 result.Answer = string.Empty;
                 continue;
@@ -215,7 +218,8 @@ public sealed class GoldfishHarnessRunner
         {
             // Do not ask the model for a last answer here.  Without an authoritative
             // tool result it could reuse stale conversation text or invent a balance.
-            result.Answer = BuildRequiredToolUnavailableAnswer();
+            result.Answer = BuildRequiredToolUnavailableAnswer(
+                HasAttemptedFamilyRewardAdjustment(result.ToolCalls));
         }
         else
         {
@@ -490,7 +494,7 @@ public sealed class GoldfishHarnessRunner
                 messages.Add(new MsChatMessage(
                     ChatRole.User,
                     RequiresToolBeforeFinal(request, hasRequiredToolResultBeforeAnswer)
-                        ? BuildRequiredToolCorrection()
+                        ? BuildRequiredToolCorrection(HasAttemptedFamilyRewardAdjustment(traceEvents))
                         : BuildFinalTextCorrection(answer)));
                 yield return GoldfishHarnessEvent.Thinking(step, "检测到过程占位话术，继续完成任务后再输出最终答复。");
                 continue;
@@ -533,7 +537,8 @@ public sealed class GoldfishHarnessRunner
         var requiredToolWasSuccessful = HasRequiredSuccessfulToolResult(request, traceEvents);
         if (RequiresToolBeforeFinal(request, requiredToolWasSuccessful))
         {
-            var unavailableAnswer = BuildRequiredToolUnavailableAnswer();
+            var unavailableAnswer = BuildRequiredToolUnavailableAnswer(
+                HasAttemptedFamilyRewardAdjustment(traceEvents));
             yield return GoldfishHarnessEvent.Text(_maxReactSteps + 1, unavailableAnswer);
             yield return GoldfishHarnessEvent.Completed(_maxReactSteps + 1, unavailableAnswer);
             yield break;
@@ -609,8 +614,9 @@ public sealed class GoldfishHarnessRunner
         GoldfishHarnessRequest request,
         IEnumerable<ToolCallRecord> toolCalls)
     {
-        var requiredPrefix = request.AgentInfo.ExtraData.GetValueOrDefault("GoldfishRequiredToolPrefix");
-        return toolCalls.Any(record => record.Success
+        var records = toolCalls as IReadOnlyCollection<ToolCallRecord> ?? toolCalls.ToArray();
+        var requiredPrefix = GetRequiredToolPrefix(request, records);
+        return records.Any(record => record.Success
             && (string.IsNullOrWhiteSpace(requiredPrefix)
                 || record.ToolId.Contains(requiredPrefix, StringComparison.OrdinalIgnoreCase)));
     }
@@ -619,21 +625,64 @@ public sealed class GoldfishHarnessRunner
         GoldfishHarnessRequest request,
         IEnumerable<GoldfishHarnessEvent> events)
     {
-        var requiredPrefix = request.AgentInfo.ExtraData.GetValueOrDefault("GoldfishRequiredToolPrefix");
-        return events.Any(ev => ev.Kind == GoldfishEventKind.ToolResult
+        var traceEvents = events as IReadOnlyCollection<GoldfishHarnessEvent> ?? events.ToArray();
+        var requiredPrefix = GetRequiredToolPrefix(request, traceEvents);
+        return traceEvents.Any(ev => ev.Kind == GoldfishEventKind.ToolResult
             && ev.Success == true
             && (string.IsNullOrWhiteSpace(requiredPrefix)
                 || (ev.ToolId?.Contains(requiredPrefix, StringComparison.OrdinalIgnoreCase) ?? false)));
     }
 
-    private static string BuildRequiredToolCorrection()
-        => """
+    private static string? GetRequiredToolPrefix(
+        GoldfishHarnessRequest request,
+        IEnumerable<ToolCallRecord> toolCalls)
+    {
+        var configuredPrefix = request.AgentInfo.ExtraData.GetValueOrDefault("GoldfishRequiredToolPrefix");
+        return IsFamilyRewardToolPolicy(configuredPrefix) && HasAttemptedFamilyRewardAdjustment(toolCalls)
+            ? FamilyRewardAdjustScoreToolId
+            : configuredPrefix;
+    }
+
+    private static string? GetRequiredToolPrefix(
+        GoldfishHarnessRequest request,
+        IEnumerable<GoldfishHarnessEvent> events)
+    {
+        var configuredPrefix = request.AgentInfo.ExtraData.GetValueOrDefault("GoldfishRequiredToolPrefix");
+        return IsFamilyRewardToolPolicy(configuredPrefix) && HasAttemptedFamilyRewardAdjustment(events)
+            ? FamilyRewardAdjustScoreToolId
+            : configuredPrefix;
+    }
+
+    private const string FamilyRewardAdjustScoreToolId = "family_reward_adjust_score";
+
+    private static bool IsFamilyRewardToolPolicy(string? requiredPrefix)
+        => string.Equals(requiredPrefix, "family_reward", StringComparison.OrdinalIgnoreCase);
+
+    private static bool HasAttemptedFamilyRewardAdjustment(IEnumerable<ToolCallRecord> toolCalls)
+        => toolCalls.Any(record => string.Equals(
+            record.ToolId,
+            FamilyRewardAdjustScoreToolId,
+            StringComparison.OrdinalIgnoreCase));
+
+    private static bool HasAttemptedFamilyRewardAdjustment(IEnumerable<GoldfishHarnessEvent> events)
+        => events.Any(ev => ev.Kind == GoldfishEventKind.ToolResult
+            && string.Equals(ev.ToolId, FamilyRewardAdjustScoreToolId, StringComparison.OrdinalIgnoreCase));
+
+    private static string BuildRequiredToolCorrection(bool adjustmentWasAttempted)
+        => adjustmentWasAttempted
+            ? """
+[Skill 工具执行约束]
+本轮已尝试执行积分变更，但尚未取得 family_reward_adjust_score 的成功结果。不得声称已加分、扣分或给出变更后的积分；必须重试该变更工具，成功后才能输出 final。
+"""
+            : """
 [Skill 工具执行约束]
 当前是查询型请求，活动 Skill 已声明结果必须来自工具，但本轮尚未取得所需工具的成功结果，因此不能输出 final。现在必须调用最合适的只读查询工具；拿到成功结果后再输出最终答案。
 """;
 
-    private static string BuildRequiredToolUnavailableAnswer()
-        => "当前查询未完成，暂不能提供积分数值，请稍后重试。";
+    private static string BuildRequiredToolUnavailableAnswer(bool adjustmentWasAttempted)
+        => adjustmentWasAttempted
+            ? "当前操作未完成，未进行积分变更，请稍后重试。"
+            : "当前查询未完成，暂不能提供积分数值，请稍后重试。";
 
     private static bool IsProvisionalFinalAnswer(string? answer)
     {

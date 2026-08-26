@@ -656,6 +656,42 @@ public sealed class GoldfishHarnessRunnerTests
     }
 
     [Fact]
+    public async Task StreamAsync_FailedScoreAdjustment_DoesNotAcceptAnotherFamilyRewardTool()
+    {
+        var chatClient = new QueueChatClient(
+            """{"action":"tool","tool":"family_reward_adjust_score","arguments":{}}""",
+            """{"action":"tool","tool":"family_reward_list_children","arguments":{}}""",
+            "已给玥玥加 2 分，当前积分 10 分。");
+        var registry = new ToolRegistry();
+        registry.Register(new ResultTool("family_reward_adjust_score", success: false));
+        registry.Register(new ResultTool("family_reward_list_children", success: true));
+        var runner = new GoldfishHarnessRunner(
+            chatClient,
+            registry,
+            maxReactSteps: 3,
+            skillRegistry: null);
+        var events = new List<GoldfishHarnessEvent>();
+
+        await foreach (var ev in runner.StreamAsync(
+            RequiredFamilyRewardRequest("对"),
+            TestContext.Current.CancellationToken))
+        {
+            events.Add(ev);
+        }
+
+        Assert.Contains(events, ev => ev.Kind == GoldfishEventKind.ToolResult
+            && ev.ToolId == "family_reward_adjust_score"
+            && ev.Success == false);
+        Assert.Contains(events, ev => ev.Kind == GoldfishEventKind.ToolResult
+            && ev.ToolId == "family_reward_list_children"
+            && ev.Success == true);
+        Assert.DoesNotContain(events, ev => ev.Kind == GoldfishEventKind.TextDelta
+            && (ev.Delta.Contains("已给玥玥加") || ev.Delta.Contains("10 分")));
+        Assert.Contains(events, ev => ev.Kind == GoldfishEventKind.TextDelta
+            && ev.Delta == "当前操作未完成，未进行积分变更，请稍后重试。");
+    }
+
+    [Fact]
     public async Task StreamAsync_FinalTextOnlyContinuesAfterUnresolvedExactNameMiss()
     {
         var chatClient = new QueueChatClient(
@@ -1085,6 +1121,22 @@ public sealed class GoldfishHarnessRunnerTests
         {
             Success = true,
             Data = new { ok = true }
+        });
+    }
+
+    private sealed class ResultTool(string id, bool success) : ITool
+    {
+        public string Id { get; } = id;
+        public string Name => Id;
+        public string Description => "Returns the requested test result.";
+        public string ParametersSchema => """{\"type\":\"object\",\"additionalProperties\":true}""";
+        public Task<bool> IsAvailableAsync() => Task.FromResult(true);
+
+        public Task<ToolResult> ExecuteAsync(string arguments) => Task.FromResult(new ToolResult
+        {
+            Success = success,
+            Error = success ? null : "score adjustment failed",
+            Data = new { ok = success }
         });
     }
 
