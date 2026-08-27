@@ -229,8 +229,25 @@ public sealed class WhitespacePreservingOpenAiChatClient : IChatClient, IDisposa
             ["temperature"] = options?.Temperature,
             ["max_tokens"] = options?.MaxOutputTokens ?? _defaultMaxOutputTokens,
             ["tools"] = tools.Count == 0 ? null : tools,
-            ["tool_choice"] = tools.Count == 0 ? null : "auto",
+            ["tool_choice"] = ResolveToolChoice(options, tools.Count),
             ["parallel_tool_calls"] = tools.Count == 0 ? null : options?.AllowMultipleToolCalls
+        };
+    }
+
+    private static object? ResolveToolChoice(ChatOptions? options, int toolCount)
+    {
+        if (toolCount == 0) return null;
+
+        return options?.ToolMode switch
+        {
+            RequiredChatToolMode { RequiredFunctionName: { Length: > 0 } name } => new
+            {
+                type = "function",
+                function = new { name }
+            },
+            RequiredChatToolMode => "required",
+            NoneChatToolMode => "none",
+            _ => "auto"
         };
     }
 

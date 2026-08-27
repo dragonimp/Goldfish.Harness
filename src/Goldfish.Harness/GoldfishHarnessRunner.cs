@@ -103,7 +103,10 @@ public sealed class GoldfishHarnessRunner
                 result.Events.Add(GoldfishHarnessEvent.Thinking(step, $"收到 {steers.Count} 条运行期 steer，已加入下一次模型调用。"));
             }
 
-            var response = await _chatClient.GetResponseAsync(messages, BuildChatOptions(request, toolFunctions), ct);
+            var response = await _chatClient.GetResponseAsync(
+                messages,
+                BuildChatOptions(request, toolFunctions, result.ToolCalls),
+                ct);
             if (response.Usage is not null)
             {
                 result.Events.Add(GoldfishHarnessEvent.TokenUsage(step, response.Usage));
@@ -191,7 +194,7 @@ public sealed class GoldfishHarnessRunner
                 messages.Add(new MsChatMessage(
                     ChatRole.User,
                     requiredToolMissing
-                        ? BuildRequiredToolCorrection(HasAttemptedFamilyRewardAdjustment(result.ToolCalls))
+                        ? BuildRequiredToolCorrection(request, result.ToolCalls)
                         : BuildFinalTextCorrection(result.Answer)));
                 result.Answer = string.Empty;
                 continue;
@@ -218,8 +221,7 @@ public sealed class GoldfishHarnessRunner
         {
             // Do not ask the model for a last answer here.  Without an authoritative
             // tool result it could reuse stale conversation text or invent a balance.
-            result.Answer = BuildRequiredToolUnavailableAnswer(
-                HasAttemptedFamilyRewardAdjustment(result.ToolCalls));
+            result.Answer = BuildRequiredToolUnavailableAnswer(request, result.ToolCalls);
         }
         else
         {
@@ -336,7 +338,10 @@ public sealed class GoldfishHarnessRunner
             var rawBuilder = new StringBuilder();
             var pendingTextBuilder = new StringBuilder();
             bool? streamTextDirectly = finalTextOnly || toolWasUsed ? false : null;
-            await foreach (var update in _chatClient.GetStreamingResponseAsync(messages, BuildChatOptions(request, toolFunctions), ct))
+            await foreach (var update in _chatClient.GetStreamingResponseAsync(
+                messages,
+                BuildChatOptions(request, toolFunctions, traceEvents: traceEvents),
+                ct))
             {
                 updates.Add(update);
 
@@ -494,7 +499,7 @@ public sealed class GoldfishHarnessRunner
                 messages.Add(new MsChatMessage(
                     ChatRole.User,
                     RequiresToolBeforeFinal(request, hasRequiredToolResultBeforeAnswer)
-                        ? BuildRequiredToolCorrection(HasAttemptedFamilyRewardAdjustment(traceEvents))
+                        ? BuildRequiredToolCorrection(request, traceEvents)
                         : BuildFinalTextCorrection(answer)));
                 yield return GoldfishHarnessEvent.Thinking(step, "检测到过程占位话术，继续完成任务后再输出最终答复。");
                 continue;
@@ -537,8 +542,7 @@ public sealed class GoldfishHarnessRunner
         var requiredToolWasSuccessful = HasRequiredSuccessfulToolResult(request, traceEvents);
         if (RequiresToolBeforeFinal(request, requiredToolWasSuccessful))
         {
-            var unavailableAnswer = BuildRequiredToolUnavailableAnswer(
-                HasAttemptedFamilyRewardAdjustment(traceEvents));
+            var unavailableAnswer = BuildRequiredToolUnavailableAnswer(request, traceEvents);
             yield return GoldfishHarnessEvent.Text(_maxReactSteps + 1, unavailableAnswer);
             yield return GoldfishHarnessEvent.Completed(_maxReactSteps + 1, unavailableAnswer);
             yield break;
@@ -615,6 +619,10 @@ public sealed class GoldfishHarnessRunner
         IEnumerable<ToolCallRecord> toolCalls)
     {
         var records = toolCalls as IReadOnlyCollection<ToolCallRecord> ?? toolCalls.ToArray();
+        if (RequiresFamilyRewardRuleWorkflow(request))
+        {
+            return HasVerifiedFamilyRewardRuleApplication(records.Select(record => new FamilyRewardToolOutcome(record.ToolId, record.Success)));
+        }
         var requiredPrefix = GetRequiredToolPrefix(request, records);
         return records.Any(record => record.Success
             && (string.IsNullOrWhiteSpace(requiredPrefix)
@@ -626,6 +634,12 @@ public sealed class GoldfishHarnessRunner
         IEnumerable<GoldfishHarnessEvent> events)
     {
         var traceEvents = events as IReadOnlyCollection<GoldfishHarnessEvent> ?? events.ToArray();
+        if (RequiresFamilyRewardRuleWorkflow(request))
+        {
+            return HasVerifiedFamilyRewardRuleApplication(traceEvents
+                .Where(ev => ev.Kind == GoldfishEventKind.ToolResult)
+                .Select(ev => new FamilyRewardToolOutcome(ev.ToolId, ev.Success == true)));
+        }
         var requiredPrefix = GetRequiredToolPrefix(request, traceEvents);
         return traceEvents.Any(ev => ev.Kind == GoldfishEventKind.ToolResult
             && ev.Success == true
@@ -654,35 +668,158 @@ public sealed class GoldfishHarnessRunner
     }
 
     private const string FamilyRewardAdjustScoreToolId = "family_reward_adjust_score";
+    private const string FamilyRewardApplyMatchingRuleToolId = "family_reward_apply_matching_rule";
+    private const string FamilyRewardQueryScoreToolId = "family_reward_query_score";
+    private const string FamilyRewardQueryRulesToolId = "family_reward_query_rules";
 
     private static bool IsFamilyRewardToolPolicy(string? requiredPrefix)
         => string.Equals(requiredPrefix, "family_reward", StringComparison.OrdinalIgnoreCase);
 
+    // A behavior such as “玥玥主动帮助别人，加分” is an executable record request,
+    // not a request to merely explain or list rules.  Keep this deliberately narrow:
+    // generic questions about how to use points still retain normal tool selection.
+    private static bool RequiresFamilyRewardRuleWorkflow(GoldfishHarnessRequest request)
+    {
+        if (!IsFamilyRewardToolPolicy(request.AgentInfo.ExtraData.GetValueOrDefault("GoldfishRequiredToolPrefix")))
+        {
+            return false;
+        }
+
+        var text = request.UserMessageText ?? string.Empty;
+        var requestsPointChange = Regex.IsMatch(text, @"(加分|扣分|加积分|扣积分|增加积分|减少积分|奖励|惩罚)", RegexOptions.CultureInvariant);
+        var describesBehavior = Regex.IsMatch(text, @"(主动|帮助|完成|做了|表现|今天|昨天|因为|，|,)", RegexOptions.CultureInvariant);
+        return requestsPointChange && describesBehavior;
+    }
+
+    private static bool HasVerifiedFamilyRewardRuleApplication(IEnumerable<FamilyRewardToolOutcome> outcomes)
+    {
+        var rulesWereRead = false;
+        var applied = false;
+        foreach (var outcome in outcomes)
+        {
+            if (outcome.Success
+                && string.Equals(outcome.ToolId, FamilyRewardQueryRulesToolId, StringComparison.OrdinalIgnoreCase))
+            {
+                rulesWereRead = true;
+                continue;
+            }
+
+            if (string.Equals(outcome.ToolId, FamilyRewardApplyMatchingRuleToolId, StringComparison.OrdinalIgnoreCase))
+            {
+                applied = rulesWereRead && outcome.Success;
+                continue;
+            }
+
+            // Only accept a balance read which occurs after a successful rule
+            // application. This is the authoritative equivalent of reopening the
+            // family-reward home page after the write.
+            if (applied
+                && outcome.Success
+                && string.Equals(outcome.ToolId, FamilyRewardQueryScoreToolId, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private readonly record struct FamilyRewardToolOutcome(string? ToolId, bool Success);
+
     private static bool HasAttemptedFamilyRewardAdjustment(IEnumerable<ToolCallRecord> toolCalls)
-        => toolCalls.Any(record => string.Equals(
-            record.ToolId,
-            FamilyRewardAdjustScoreToolId,
-            StringComparison.OrdinalIgnoreCase));
+        => toolCalls.Any(record => IsFamilyRewardScoreWriteTool(record.ToolId));
 
     private static bool HasAttemptedFamilyRewardAdjustment(IEnumerable<GoldfishHarnessEvent> events)
         => events.Any(ev => ev.Kind == GoldfishEventKind.ToolResult
-            && string.Equals(ev.ToolId, FamilyRewardAdjustScoreToolId, StringComparison.OrdinalIgnoreCase));
+            && IsFamilyRewardScoreWriteTool(ev.ToolId));
+
+    private static bool HasAttemptedFamilyRewardAdjustment(IEnumerable<FamilyRewardToolOutcome> outcomes)
+        => outcomes.Any(outcome => IsFamilyRewardScoreWriteTool(outcome.ToolId));
+
+    private static bool IsFamilyRewardScoreWriteTool(string? toolId)
+        => string.Equals(toolId, FamilyRewardAdjustScoreToolId, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(toolId, FamilyRewardApplyMatchingRuleToolId, StringComparison.OrdinalIgnoreCase);
+
+    private static string BuildRequiredToolCorrection(GoldfishHarnessRequest request, IEnumerable<ToolCallRecord> toolCalls)
+        => BuildRequiredToolCorrection(
+            request,
+            toolCalls.Select(record => new FamilyRewardToolOutcome(record.ToolId, record.Success)));
+
+    private static string BuildRequiredToolCorrection(GoldfishHarnessRequest request, IEnumerable<GoldfishHarnessEvent> events)
+        => BuildRequiredToolCorrection(
+            request,
+            events.Where(ev => ev.Kind == GoldfishEventKind.ToolResult)
+                .Select(ev => new FamilyRewardToolOutcome(ev.ToolId, ev.Success == true)));
+
+    private static string BuildRequiredToolCorrection(GoldfishHarnessRequest request, IEnumerable<FamilyRewardToolOutcome> outcomes)
+    {
+        var materialized = outcomes.ToList();
+        var workflowTool = GetRequiredFamilyRewardWorkflowTool(request, materialized);
+        if (workflowTool == FamilyRewardQueryRulesToolId)
+        {
+            return """
+[家庭积分规则核对]
+这是按行为记分请求。必须先调用 family_reward_query_rules，读取当前家长的生效规则并确认匹配项与分值；不得只查询积分或直接声称已记分。
+""";
+        }
+        if (workflowTool == FamilyRewardApplyMatchingRuleToolId)
+        {
+            return """
+[家庭积分规则记分]
+当前规则已查询成功。现在必须调用 family_reward_apply_matching_rule，传入目标孩子和完整行为描述，由服务端按刚核对的当前生效规则写入积分；工具成功前不得声称已加分或扣分。
+""";
+        }
+        if (workflowTool == FamilyRewardQueryScoreToolId)
+        {
+            return """
+[家庭积分余额核验]
+family_reward_apply_matching_rule 已成功写入积分，但最终答复前必须调用 family_reward_query_score，按同一孩子查询最新余额（建议 include_transactions=true），确认首页可见余额与本次积分流水后才能输出 final。
+""";
+        }
+
+        return BuildRequiredToolCorrection(HasAttemptedFamilyRewardAdjustment(materialized));
+    }
 
     private static string BuildRequiredToolCorrection(bool adjustmentWasAttempted)
         => adjustmentWasAttempted
             ? """
 [Skill 工具执行约束]
-本轮已尝试执行积分变更，但尚未取得 family_reward_adjust_score 的成功结果。不得声称已加分、扣分或给出变更后的积分；必须重试该变更工具，成功后才能输出 final。
+本轮已尝试执行积分变更，但尚未取得成功结果。不得声称已加分、扣分或给出变更后的积分；必须重试对应积分变更工具，成功后才能输出 final。
 """
             : """
 [Skill 工具执行约束]
 当前是查询型请求，活动 Skill 已声明结果必须来自工具，但本轮尚未取得所需工具的成功结果，因此不能输出 final。现在必须调用最合适的只读查询工具；拿到成功结果后再输出最终答案。
 """;
 
-    private static string BuildRequiredToolUnavailableAnswer(bool adjustmentWasAttempted)
-        => adjustmentWasAttempted
+    private static string BuildRequiredToolUnavailableAnswer(GoldfishHarnessRequest request, IEnumerable<ToolCallRecord> toolCalls)
+        => BuildRequiredToolUnavailableAnswer(
+            request,
+            toolCalls.Select(record => new FamilyRewardToolOutcome(record.ToolId, record.Success)));
+
+    private static string BuildRequiredToolUnavailableAnswer(GoldfishHarnessRequest request, IEnumerable<GoldfishHarnessEvent> events)
+        => BuildRequiredToolUnavailableAnswer(
+            request,
+            events.Where(ev => ev.Kind == GoldfishEventKind.ToolResult)
+                .Select(ev => new FamilyRewardToolOutcome(ev.ToolId, ev.Success == true)));
+
+    private static string BuildRequiredToolUnavailableAnswer(GoldfishHarnessRequest request, IEnumerable<FamilyRewardToolOutcome> outcomes)
+    {
+        var materialized = outcomes.ToList();
+        if (RequiresFamilyRewardRuleWorkflow(request))
+        {
+            return GetRequiredFamilyRewardWorkflowTool(request, materialized) switch
+            {
+                FamilyRewardQueryRulesToolId => "当前规则未查询完成，未进行积分变更，请稍后重试。",
+                FamilyRewardApplyMatchingRuleToolId => "当前操作未完成，未进行积分变更，请稍后重试。",
+                FamilyRewardQueryScoreToolId => "积分操作已返回成功，但最新余额尚未核验，请稍后在首页确认。",
+                _ => "当前操作未完成，请稍后重试。"
+            };
+        }
+
+        return HasAttemptedFamilyRewardAdjustment(materialized)
             ? "当前操作未完成，未进行积分变更，请稍后重试。"
             : "当前查询未完成，暂不能提供积分数值，请稍后重试。";
+    }
 
     private static bool IsProvisionalFinalAnswer(string? answer)
     {
@@ -1050,7 +1187,11 @@ JSON 格式：
         }
     }
 
-    private static ChatOptions BuildChatOptions(GoldfishHarnessRequest request, IReadOnlyDictionary<string, ToolFunction> toolFunctions)
+    private static ChatOptions BuildChatOptions(
+        GoldfishHarnessRequest request,
+        IReadOnlyDictionary<string, ToolFunction> toolFunctions,
+        IEnumerable<ToolCallRecord>? toolCalls = null,
+        IEnumerable<GoldfishHarnessEvent>? traceEvents = null)
     {
         var options = new ChatOptions
         {
@@ -1061,11 +1202,66 @@ JSON 格式：
         if (toolFunctions.Count > 0)
         {
             options.Tools = toolFunctions.Values.Cast<AITool>().ToList();
-            options.ToolMode = ChatToolMode.Auto;
+            var requiredTool = GetRequiredFamilyRewardWorkflowTool(request, toolCalls, traceEvents);
+            options.ToolMode = !string.IsNullOrWhiteSpace(requiredTool) && toolFunctions.ContainsKey(requiredTool)
+                ? ChatToolMode.RequireSpecific(requiredTool)
+                : RequiresToolBeforeFinal(request, toolWasUsed: false)
+                    ? ChatToolMode.RequireAny
+                    : ChatToolMode.Auto;
             options.AllowMultipleToolCalls = true;
         }
 
         return options;
+    }
+
+    private static string? GetRequiredFamilyRewardWorkflowTool(
+        GoldfishHarnessRequest request,
+        IEnumerable<ToolCallRecord>? toolCalls,
+        IEnumerable<GoldfishHarnessEvent>? traceEvents)
+    {
+        if (!RequiresFamilyRewardRuleWorkflow(request)) return null;
+
+        var outcomes = toolCalls is not null
+            ? toolCalls.Select(record => new FamilyRewardToolOutcome(record.ToolId, record.Success)).ToList()
+            : traceEvents?.Where(ev => ev.Kind == GoldfishEventKind.ToolResult)
+                .Select(ev => new FamilyRewardToolOutcome(ev.ToolId, ev.Success == true)).ToList()
+                ?? [];
+        return GetRequiredFamilyRewardWorkflowTool(request, outcomes);
+    }
+
+    private static string? GetRequiredFamilyRewardWorkflowTool(
+        GoldfishHarnessRequest request,
+        IEnumerable<FamilyRewardToolOutcome> outcomes)
+    {
+        if (!RequiresFamilyRewardRuleWorkflow(request)) return null;
+
+        var materialized = outcomes.ToList();
+        var rulesWereRead = materialized.Any(outcome => outcome.Success
+            && string.Equals(outcome.ToolId, FamilyRewardQueryRulesToolId, StringComparison.OrdinalIgnoreCase));
+        if (!rulesWereRead) return FamilyRewardQueryRulesToolId;
+
+        var applied = false;
+        foreach (var outcome in materialized)
+        {
+            if (outcome.Success
+                && string.Equals(outcome.ToolId, FamilyRewardQueryRulesToolId, StringComparison.OrdinalIgnoreCase))
+            {
+                rulesWereRead = true;
+                continue;
+            }
+
+            if (rulesWereRead
+                && outcome.Success
+                && string.Equals(outcome.ToolId, FamilyRewardApplyMatchingRuleToolId, StringComparison.OrdinalIgnoreCase))
+            {
+                applied = true;
+            }
+        }
+        if (!applied) return FamilyRewardApplyMatchingRuleToolId;
+
+        return HasVerifiedFamilyRewardRuleApplication(materialized)
+            ? null
+            : FamilyRewardQueryScoreToolId;
     }
 
     private List<MsChatMessage> BuildMessages(GoldfishHarnessRequest request)

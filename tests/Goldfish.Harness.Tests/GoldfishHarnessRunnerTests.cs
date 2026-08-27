@@ -53,6 +53,23 @@ public sealed class GoldfishHarnessRunnerTests
     }
 
     [Fact]
+    public void OpenAiChatClient_SerializesRequiredSpecificToolChoice()
+    {
+        var method = typeof(WhitespacePreservingOpenAiChatClient).GetMethod(
+            "ResolveToolChoice",
+            BindingFlags.Static | BindingFlags.NonPublic)!;
+        var choice = method.Invoke(null,
+        [
+            new ChatOptions { ToolMode = ChatToolMode.RequireSpecific("family_reward_apply_matching_rule") },
+            1
+        ]);
+
+        Assert.Equal(
+            "{\"type\":\"function\",\"function\":{\"name\":\"family_reward_apply_matching_rule\"}}",
+            JsonSerializer.Serialize(choice));
+    }
+
+    [Fact]
     public void GoldfishLlmHeaders_UseGatewayRequestIdAsAppRequestId()
     {
         using var document = JsonDocument.Parse("""
@@ -689,6 +706,50 @@ public sealed class GoldfishHarnessRunnerTests
             && (ev.Delta.Contains("已给玥玥加") || ev.Delta.Contains("10 分")));
         Assert.Contains(events, ev => ev.Kind == GoldfishEventKind.TextDelta
             && ev.Delta == "当前操作未完成，未进行积分变更，请稍后重试。");
+    }
+
+    [Fact]
+    public async Task StreamAsync_RuleBasedScoreAddition_RequiresBalanceVerificationAfterWrite()
+    {
+        var chatClient = new QueueChatClient(
+            """{"action":"tool","tool":"family_reward_query_rules","arguments":{}}""",
+            "已查到规则，现在为玥玥加分。",
+            """{"action":"tool","tool":"family_reward_apply_matching_rule","arguments":{}}""",
+            "已按规则给玥玥加分。",
+            """{"action":"tool","tool":"family_reward_query_score","arguments":{}}""",
+            "已按“主动帮助别人”规则给玥玥加 2 分，首页余额已核验为 12 分。");
+        var registry = new ToolRegistry();
+        registry.Register(new ResultTool("family_reward_query_rules", success: true));
+        registry.Register(new ResultTool("family_reward_apply_matching_rule", success: true));
+        registry.Register(new ResultTool("family_reward_query_score", success: true));
+        var runner = new GoldfishHarnessRunner(
+            chatClient,
+            registry,
+            maxReactSteps: 6,
+            skillRegistry: null);
+        var events = new List<GoldfishHarnessEvent>();
+
+        await foreach (var ev in runner.StreamAsync(
+            RequiredFamilyRewardRequest("玥玥主动帮助别人，加分"),
+            TestContext.Current.CancellationToken))
+        {
+            events.Add(ev);
+        }
+
+        Assert.Contains(events, ev => ev.Kind == GoldfishEventKind.ToolResult
+            && ev.ToolId == "family_reward_query_rules"
+            && ev.Success == true);
+        Assert.Contains(events, ev => ev.Kind == GoldfishEventKind.ToolResult
+            && ev.ToolId == "family_reward_apply_matching_rule"
+            && ev.Success == true);
+        Assert.Contains(events, ev => ev.Kind == GoldfishEventKind.ToolResult
+            && ev.ToolId == "family_reward_query_score"
+            && ev.Success == true);
+        Assert.Contains(events, ev => ev.Kind == GoldfishEventKind.TextDelta
+            && ev.Delta.Contains("首页余额已核验为 12 分"));
+        Assert.Equal(6, chatClient.Calls.Count);
+        Assert.Contains("家庭积分规则记分", chatClient.Calls[2].Last().Text);
+        Assert.Contains("家庭积分余额核验", chatClient.Calls[4].Last().Text);
     }
 
     [Fact]
