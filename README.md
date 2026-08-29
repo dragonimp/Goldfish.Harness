@@ -54,22 +54,20 @@ are redacted before persistence.
 
 ## ACP host
 
-The ACP protocol core remains an AgentFree-owned project. Harness does not carry
-its source project and does not use a cross-repository `ProjectReference`.
-`Goldfish.Harness.AcpHost` references the synchronized
-`lib/Goldfish.Acp/Goldfish.Acp.dll` artifact directly. The artifact directory
-also contains its runtime dependencies, ACP license, and a manifest binding the
-DLL hash to the AgentFree source commit and schema release.
+The ACP protocol core is built by Orbit's dedicated `src/Orbit.Acp` project.
+Harness does not carry its source project and does not use a cross-repository
+`ProjectReference`. `Goldfish.Harness.AcpHost` references the generated Orbit
+DLL directly; its build target first builds that project so no copied binary
+snapshot can drift from the public protocol build.
 
-Refresh and verify the binary from an AgentFree checkout:
+Verify the Orbit DLL from a sibling Orbit checkout:
 
 ```bash
-GOLDFISH_HARNESS_ROOT=/absolute/Goldfish.Harness \
-  /absolute/AgentFree/scripts/sync-acp-core-to-harness.sh --write
+ORBIT_ROOT=/absolute/AgentFree \
 ./scripts/verify-acp-binary.sh
 ```
 
-Do not edit files under `lib/Goldfish.Acp` manually.
+Do not add an ACP source project or copied ACP binary to Harness.
 
 Build or publish the independent host without AgentNode:
 

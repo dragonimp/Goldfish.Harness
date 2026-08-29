@@ -5,11 +5,14 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>Goldfish.Harness.AcpHost</AssemblyName>
+    <OrbitRoot>$(MSBuildThisFileDirectory)../../../AgentFree</OrbitRoot>
+    <OrbitAcpProject>$(OrbitRoot)/src/Orbit.Acp/Orbit.Acp.csproj</OrbitAcpProject>
+    <OrbitAcpDll>$(OrbitRoot)/src/Orbit.Acp/bin/$(Configuration)/net10.0/Goldfish.Acp.dll</OrbitAcpDll>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../Goldfish.Harness/Goldfish.Harness.csproj" />
     <Reference Include="Goldfish.Acp">
-      <HintPath>../../lib/Goldfish.Acp/Goldfish.Acp.dll</HintPath>
+      <HintPath>$(OrbitAcpDll)</HintPath>
       <Private>true</Private>
     </Reference>
   </ItemGroup>
@@ -17,4 +20,8 @@
     <PackageReference Include="Microsoft.Extensions.AI.Abstractions" Version="10.6.0" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.8" />
   </ItemGroup>
+  <Target Name="BuildOrbitPublicAcp" BeforeTargets="ResolveReferences">
+    <Error Condition="!Exists('$(OrbitAcpProject)')" Text="Orbit public ACP project is unavailable: $(OrbitAcpProject)" />
+    <MSBuild Projects="$(OrbitAcpProject)" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+  </Target>
 </Project>
