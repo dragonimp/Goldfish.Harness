@@ -4,6 +4,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <GenerateDepsFile>true</GenerateDepsFile>
     <AssemblyName>Goldfish.Harness.AcpHost</AssemblyName>
     <OrbitRoot>$(MSBuildThisFileDirectory)../../../AgentFree</OrbitRoot>
     <OrbitAcpProject>$(OrbitRoot)/src/Orbit.Acp/Orbit.Acp.csproj</OrbitAcpProject>
